@@ -2328,6 +2328,116 @@ def remap_batch_integer_primary_keys(table_name: str, id_column: str, rows: list
     return mappings
 
 
+def detect_and_insert_anomalies_for_performance(perf_ids: list[int], user: dict[str, Any], batch_id: str) -> list[dict[str, Any]]:
+    if not perf_ids:
+        return []
+    placeholders = ", ".join(["%s"] * len(perf_ids))
+    candidates = query_all(
+        f"""
+        SELECT
+            p.perf_id,
+            p.airfoil_id,
+            p.version_id,
+            p.alpha_deg,
+            p.reynolds_number,
+            p.cl,
+            p.cd,
+            p.cm,
+            CASE
+                WHEN p.cd < 0 THEN 'negative_cd'
+                WHEN ABS(p.cl) > 2 THEN 'extreme_cl'
+                WHEN p.cd <> 0 AND ABS(p.cl / p.cd) > 100 THEN 'extreme_ld_ratio'
+                ELSE NULL
+            END AS rule_type
+        FROM performance_records p
+        LEFT JOIN anomaly_records ar ON ar.perf_id = p.perf_id
+        WHERE p.perf_id IN ({placeholders})
+          AND ar.perf_id IS NULL
+          AND (
+                p.cd < 0
+                OR ABS(p.cl) > 2
+                OR (p.cd <> 0 AND ABS(p.cl / p.cd) > 100)
+          )
+        ORDER BY p.perf_id
+        """,
+        tuple(perf_ids),
+    )
+    candidates = [row for row in candidates if row.get("rule_type")]
+    if not candidates:
+        return []
+
+    conn = get_db_connection()
+    inserted_rows: list[dict[str, Any]] = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(anomaly_id), 0) AS max_id FROM anomaly_records")
+            next_id = int((cur.fetchone() or {}).get("max_id") or 0) + 1
+            candidate_ids = tuple(int(row["perf_id"]) for row in candidates)
+            candidate_placeholders = ", ".join(["%s"] * len(candidate_ids))
+            cur.execute(
+                f"UPDATE performance_records SET is_anomaly = 1 WHERE perf_id IN ({candidate_placeholders})",
+                candidate_ids,
+            )
+            for index, row in enumerate(candidates):
+                anomaly_id = next_id + index
+                cl = float(row["cl"])
+                cd = float(row["cd"])
+                ratio = None if cd == 0 else cl / cd
+                detail = (
+                    f"Auto detected after batch import {batch_id}: "
+                    f"rule={row['rule_type']}; alpha={row['alpha_deg']}; "
+                    f"Re={row['reynolds_number']}; cl={row['cl']}; cd={row['cd']}; "
+                    f"cl_cd_ratio={'' if ratio is None else round(ratio, 6)}"
+                )
+                cur.execute(
+                    """
+                    INSERT INTO anomaly_records
+                        (anomaly_id, perf_id, airfoil_id, version_id, rule_type, detail)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        anomaly_id,
+                        row["perf_id"],
+                        row["airfoil_id"],
+                        row["version_id"],
+                        row["rule_type"],
+                        detail,
+                    ),
+                )
+                inserted_rows.append(
+                    {
+                        "anomaly_id": anomaly_id,
+                        "perf_id": row["perf_id"],
+                        "airfoil_id": row["airfoil_id"],
+                        "version_id": row["version_id"],
+                        "rule_type": row["rule_type"],
+                        "detail": detail,
+                    }
+                )
+        conn.commit()
+    except pymysql.MySQLError:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+    for row in inserted_rows:
+        record_pk = str(row["anomaly_id"])
+        source_version = f"version {row['version_id']}"
+        log_data_import(
+            "anomaly_records",
+            record_pk,
+            "system",
+            user,
+            airfoil_id=str(row["airfoil_id"]),
+            version_id=int(row["version_id"]),
+            source_type="auto_anomaly_detection",
+            description=f"batch_id={batch_id}; perf_id={row['perf_id']}; rule={row['rule_type']}",
+        )
+        mark_lineage_insert("anomaly_records", record_pk, str(row["airfoil_id"]), source_version)
+    return inserted_rows
+
+
 def import_generic_batch(table_name: str, batch_id: str, columns: list[str], rows: list[dict[str, Any]], user: dict[str, Any]) -> dict[str, Any]:
     parsed_rows: list[dict[str, Any]] = []
     for row_no, row in enumerate(rows, start=2):
@@ -2494,6 +2604,24 @@ def import_performance_batch(user: dict[str, Any], payload: dict[str, Any]) -> A
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     status_rows = result_sets[0] if result_sets else []
     ok = bool(status_rows and status_rows[0].get("status") == "imported")
+    detected_anomalies: list[dict[str, Any]] = []
+    if ok:
+        try:
+            detected_anomalies = detect_and_insert_anomalies_for_performance(perf_ids, user, batch_id)
+        except pymysql.MySQLError as exc:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            log_user_action(user["user_id"], f"Failed anomaly detection for batch {batch_id}", "INSERT INTO anomaly_records", 0, elapsed_ms)
+            return jsonify({"error": friendly_mysql_error(exc, "anomaly_records")}), 400
+
+        imported_rows = query_all(
+            f"""
+            SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, is_anomaly
+            FROM performance_records
+            WHERE perf_id IN ({placeholders})
+            ORDER BY perf_id
+            """,
+            tuple(perf_ids),
+        )
     for row in imported_rows:
         record_pk, airfoil_id, version_id, source_type, source_version = batch_record_identity("performance_records", row)
         log_data_import(
@@ -2520,6 +2648,7 @@ def import_performance_batch(user: dict[str, Any], payload: dict[str, Any]) -> A
                 {"title": "Rejected rows", "rows": result_sets[1] if len(result_sets) > 1 else []},
                 {"title": "Staging rows", "rows": staged_rows},
                 {"title": "Imported rows", "rows": imported_rows},
+                {"title": "Auto anomaly detection", "rows": detected_anomalies},
             ],
         }
     )
@@ -2636,6 +2765,24 @@ def run_performance_import() -> Any:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     status_rows = result_sets[0] if result_sets else []
     ok = bool(status_rows and status_rows[0].get("status") == "imported")
+    detected_anomalies: list[dict[str, Any]] = []
+    if ok:
+        try:
+            detected_anomalies = detect_and_insert_anomalies_for_performance(perf_ids, user, batch_id)
+        except pymysql.MySQLError as exc:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            log_user_action(user["user_id"], f"Failed anomaly detection for batch {batch_id}", "INSERT INTO anomaly_records", 0, elapsed_ms)
+            return jsonify({"error": friendly_mysql_error(exc, "anomaly_records")}), 400
+
+        imported_rows = query_all(
+            f"""
+            SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, is_anomaly
+            FROM performance_records
+            WHERE perf_id IN ({placeholders})
+            ORDER BY perf_id
+            """,
+            tuple(perf_ids),
+        )
     log_user_action(user["user_id"], f"Performance batch import {batch_id}", "CALL sp_import_performance_batch", 1 if ok else 0, elapsed_ms)
     return jsonify(
         {
@@ -2646,6 +2793,7 @@ def run_performance_import() -> Any:
                 {"title": "Rejected rows", "rows": result_sets[1] if len(result_sets) > 1 else []},
                 {"title": "Staging rows", "rows": staged_rows},
                 {"title": "Imported rows", "rows": imported_rows},
+                {"title": "Auto anomaly detection", "rows": detected_anomalies},
             ],
         }
     )
