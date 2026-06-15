@@ -1,0 +1,365 @@
+AG09
+# augmentation_status: original_real_uiuc_coordinates_no_augmentation_required
+# original_point_count: 180
+# final_point_count: 180
+# point labels: each coordinate is preceded by point_type; real means original file coordinate, augmented means inserted interpolation coordinate
+# point_type: real; original_order: 1
+0.9999920 0.0009750
+# point_type: real; original_order: 2
+0.9948770 0.0013850
+# point_type: real; original_order: 3
+0.9849970 0.0021720
+# point_type: real; original_order: 4
+0.9733550 0.0030920
+# point_type: real; original_order: 5
+0.9610140 0.0040630
+# point_type: real; original_order: 6
+0.9484710 0.0050400
+# point_type: real; original_order: 7
+0.9358790 0.0060150
+# point_type: real; original_order: 8
+0.9232690 0.0069850
+# point_type: real; original_order: 9
+0.9106510 0.0079470
+# point_type: real; original_order: 10
+0.8980360 0.0089020
+# point_type: real; original_order: 11
+0.8854240 0.0098490
+# point_type: real; original_order: 12
+0.8728210 0.0107880
+# point_type: real; original_order: 13
+0.8602200 0.0117220
+# point_type: real; original_order: 14
+0.8476200 0.0126460
+# point_type: real; original_order: 15
+0.8350240 0.0135620
+# point_type: real; original_order: 16
+0.8224270 0.0144720
+# point_type: real; original_order: 17
+0.8098280 0.0153750
+# point_type: real; original_order: 18
+0.7972300 0.0162710
+# point_type: real; original_order: 19
+0.7846290 0.0171660
+# point_type: real; original_order: 20
+0.7720250 0.0180560
+# point_type: real; original_order: 21
+0.7594200 0.0189390
+# point_type: real; original_order: 22
+0.7468110 0.0198210
+# point_type: real; original_order: 23
+0.7341960 0.0206930
+# point_type: real; original_order: 24
+0.7215810 0.0215570
+# point_type: real; original_order: 25
+0.7089620 0.0224120
+# point_type: real; original_order: 26
+0.6963430 0.0232560
+# point_type: real; original_order: 27
+0.6837220 0.0240920
+# point_type: real; original_order: 28
+0.6711040 0.0249160
+# point_type: real; original_order: 29
+0.6584840 0.0257290
+# point_type: real; original_order: 30
+0.6458660 0.0265330
+# point_type: real; original_order: 31
+0.6332500 0.0273190
+# point_type: real; original_order: 32
+0.6206370 0.0280930
+# point_type: real; original_order: 33
+0.6080260 0.0288570
+# point_type: real; original_order: 34
+0.5954180 0.0296030
+# point_type: real; original_order: 35
+0.5828150 0.0303360
+# point_type: real; original_order: 36
+0.5702210 0.0310520
+# point_type: real; original_order: 37
+0.5576320 0.0317520
+# point_type: real; original_order: 38
+0.5450470 0.0324360
+# point_type: real; original_order: 39
+0.5324690 0.0331000
+# point_type: real; original_order: 40
+0.5198980 0.0337450
+# point_type: real; original_order: 41
+0.5073320 0.0343740
+# point_type: real; original_order: 42
+0.4947750 0.0349810
+# point_type: real; original_order: 43
+0.4822240 0.0355680
+# point_type: real; original_order: 44
+0.4696800 0.0361320
+# point_type: real; original_order: 45
+0.4571440 0.0366790
+# point_type: real; original_order: 46
+0.4446180 0.0372020
+# point_type: real; original_order: 47
+0.4320980 0.0377020
+# point_type: real; original_order: 48
+0.4195890 0.0381800
+# point_type: real; original_order: 49
+0.4070890 0.0386340
+# point_type: real; original_order: 50
+0.3946000 0.0390650
+# point_type: real; original_order: 51
+0.3821230 0.0394670
+# point_type: real; original_order: 52
+0.3696570 0.0398440
+# point_type: real; original_order: 53
+0.3572050 0.0401900
+# point_type: real; original_order: 54
+0.3447690 0.0405060
+# point_type: real; original_order: 55
+0.3323440 0.0407890
+# point_type: real; original_order: 56
+0.3199290 0.0410390
+# point_type: real; original_order: 57
+0.3075260 0.0412500
+# point_type: real; original_order: 58
+0.2951340 0.0414220
+# point_type: real; original_order: 59
+0.2827510 0.0415500
+# point_type: real; original_order: 60
+0.2703810 0.0416290
+# point_type: real; original_order: 61
+0.2580220 0.0416570
+# point_type: real; original_order: 62
+0.2456730 0.0416300
+# point_type: real; original_order: 63
+0.2333350 0.0415430
+# point_type: real; original_order: 64
+0.2210130 0.0413870
+# point_type: real; original_order: 65
+0.2087010 0.0411590
+# point_type: real; original_order: 66
+0.1964090 0.0408520
+# point_type: real; original_order: 67
+0.1841370 0.0404560
+# point_type: real; original_order: 68
+0.1718900 0.0399620
+# point_type: real; original_order: 69
+0.1596740 0.0393600
+# point_type: real; original_order: 70
+0.1475000 0.0386390
+# point_type: real; original_order: 71
+0.1353840 0.0377860
+# point_type: real; original_order: 72
+0.1233460 0.0367810
+# point_type: real; original_order: 73
+0.1114030 0.0356110
+# point_type: real; original_order: 74
+0.0995990 0.0342580
+# point_type: real; original_order: 75
+0.0879880 0.0327070
+# point_type: real; original_order: 76
+0.0766320 0.0309400
+# point_type: real; original_order: 77
+0.0655920 0.0289410
+# point_type: real; original_order: 78
+0.0549550 0.0266980
+# point_type: real; original_order: 79
+0.0448380 0.0242090
+# point_type: real; original_order: 80
+0.0354320 0.0215030
+# point_type: real; original_order: 81
+0.0270300 0.0186650
+# point_type: real; original_order: 82
+0.0199570 0.0158520
+# point_type: real; original_order: 83
+0.0143700 0.0132360
+# point_type: real; original_order: 84
+0.0101590 0.0109200
+# point_type: real; original_order: 85
+0.0070230 0.0089000
+# point_type: real; original_order: 86
+0.0046860 0.0071300
+# point_type: real; original_order: 87
+0.0029430 0.0055570
+# point_type: real; original_order: 88
+0.0016610 0.0041360
+# point_type: real; original_order: 89
+0.0007680 0.0028260
+# point_type: real; original_order: 90
+0.0002370 0.0015960
+# point_type: real; original_order: 91
+0.0000200 0.0004690
+# point_type: real; original_order: 92
+0.0000350 -0.0006070
+# point_type: real; original_order: 93
+0.0003040 -0.0017440
+# point_type: real; original_order: 94
+0.0009210 -0.0029600
+# point_type: real; original_order: 95
+0.0019830 -0.0041970
+# point_type: real; original_order: 96
+0.0035570 -0.0053880
+# point_type: real; original_order: 97
+0.0057050 -0.0065360
+# point_type: real; original_order: 98
+0.0085500 -0.0076610
+# point_type: real; original_order: 99
+0.0123250 -0.0087760
+# point_type: real; original_order: 100
+0.0173790 -0.0098780
+# point_type: real; original_order: 101
+0.0240640 -0.0108980
+# point_type: real; original_order: 102
+0.0324700 -0.0117190
+# point_type: real; original_order: 103
+0.0422860 -0.0122620
+# point_type: real; original_order: 104
+0.0530280 -0.0125120
+# point_type: real; original_order: 105
+0.0643260 -0.0125130
+# point_type: real; original_order: 106
+0.0759730 -0.0123340
+# point_type: real; original_order: 107
+0.0878600 -0.0120190
+# point_type: real; original_order: 108
+0.0999240 -0.0116220
+# point_type: real; original_order: 109
+0.1121150 -0.0111640
+# point_type: real; original_order: 110
+0.1244000 -0.0106640
+# point_type: real; original_order: 111
+0.1367590 -0.0101430
+# point_type: real; original_order: 112
+0.1492390 -0.0096160
+# point_type: real; original_order: 113
+0.1618060 -0.0090870
+# point_type: real; original_order: 114
+0.1744360 -0.0085610
+# point_type: real; original_order: 115
+0.1871200 -0.0080440
+# point_type: real; original_order: 116
+0.1997980 -0.0075400
+# point_type: real; original_order: 117
+0.2125120 -0.0070520
+# point_type: real; original_order: 118
+0.2252650 -0.0065840
+# point_type: real; original_order: 119
+0.2380670 -0.0061380
+# point_type: real; original_order: 120
+0.2508820 -0.0057190
+# point_type: real; original_order: 121
+0.2637440 -0.0053240
+# point_type: real; original_order: 122
+0.2766270 -0.0049540
+# point_type: real; original_order: 123
+0.2895360 -0.0046080
+# point_type: real; original_order: 124
+0.3024650 -0.0042840
+# point_type: real; original_order: 125
+0.3153940 -0.0039830
+# point_type: real; original_order: 126
+0.3283090 -0.0037030
+# point_type: real; original_order: 127
+0.3412000 -0.0034440
+# point_type: real; original_order: 128
+0.3540500 -0.0032060
+# point_type: real; original_order: 129
+0.3668540 -0.0029870
+# point_type: real; original_order: 130
+0.3796060 -0.0027870
+# point_type: real; original_order: 131
+0.3923090 -0.0026050
+# point_type: real; original_order: 132
+0.4049730 -0.0024400
+# point_type: real; original_order: 133
+0.4176370 -0.0022890
+# point_type: real; original_order: 134
+0.4302730 -0.0021500
+# point_type: real; original_order: 135
+0.4428930 -0.0020220
+# point_type: real; original_order: 136
+0.4555000 -0.0019050
+# point_type: real; original_order: 137
+0.4680940 -0.0017970
+# point_type: real; original_order: 138
+0.4806900 -0.0016980
+# point_type: real; original_order: 139
+0.4932810 -0.0016080
+# point_type: real; original_order: 140
+0.5058660 -0.0015260
+# point_type: real; original_order: 141
+0.5184460 -0.0014510
+# point_type: real; original_order: 142
+0.5310240 -0.0013830
+# point_type: real; original_order: 143
+0.5435990 -0.0013220
+# point_type: real; original_order: 144
+0.5561760 -0.0012670
+# point_type: real; original_order: 145
+0.5687530 -0.0012180
+# point_type: real; original_order: 146
+0.5813310 -0.0011760
+# point_type: real; original_order: 147
+0.5939120 -0.0011400
+# point_type: real; original_order: 148
+0.6064980 -0.0011100
+# point_type: real; original_order: 149
+0.6190840 -0.0010860
+# point_type: real; original_order: 150
+0.6316730 -0.0010680
+# point_type: real; original_order: 151
+0.6442620 -0.0010570
+# point_type: real; original_order: 152
+0.6568540 -0.0010510
+# point_type: real; original_order: 153
+0.6694980 -0.0010480
+# point_type: real; original_order: 154
+0.6821410 -0.0010460
+# point_type: real; original_order: 155
+0.6947880 -0.0010430
+# point_type: real; original_order: 156
+0.7074350 -0.0010400
+# point_type: real; original_order: 157
+0.7200820 -0.0010380
+# point_type: real; original_order: 158
+0.7327280 -0.0010350
+# point_type: real; original_order: 159
+0.7453730 -0.0010320
+# point_type: real; original_order: 160
+0.7580190 -0.0010300
+# point_type: real; original_order: 161
+0.7706650 -0.0010270
+# point_type: real; original_order: 162
+0.7833090 -0.0010240
+# point_type: real; original_order: 163
+0.7959540 -0.0010220
+# point_type: real; original_order: 164
+0.8086020 -0.0010190
+# point_type: real; original_order: 165
+0.8212520 -0.0010160
+# point_type: real; original_order: 166
+0.8339060 -0.0010140
+# point_type: real; original_order: 167
+0.8465660 -0.0010110
+# point_type: real; original_order: 168
+0.8592300 -0.0010080
+# point_type: real; original_order: 169
+0.8719020 -0.0010050
+# point_type: real; original_order: 170
+0.8845770 -0.0010030
+# point_type: real; original_order: 171
+0.8972470 -0.0010000
+# point_type: real; original_order: 172
+0.9099130 -0.0009970
+# point_type: real; original_order: 173
+0.9225810 -0.0009950
+# point_type: real; original_order: 174
+0.9352480 -0.0009920
+# point_type: real; original_order: 175
+0.9479120 -0.0009890
+# point_type: real; original_order: 176
+0.9605380 -0.0009870
+# point_type: real; original_order: 177
+0.9730040 -0.0009840
+# point_type: real; original_order: 178
+0.9848330 -0.0009820
+# point_type: real; original_order: 179
+0.9948500 -0.0009800
+# point_type: real; original_order: 180
+1.0000080 -0.0009780

@@ -1,0 +1,5 @@
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Collecting pymysql
+  Using cached pymysql-1.2.0-py3-none-any.whl (45 kB)
+Installing collected packages: pymysql
+Successfully installed pymysql-1.2.0

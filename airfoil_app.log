@@ -1,0 +1,51 @@
+nohup: ignoring input
+ * Serving Flask app 'app'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8765
+ * Running on http://172.25.216.211:8765
+Press CTRL+C to quit
+127.0.0.1 - - [04/Jun/2026 16:27:50] "GET /api/airfoils/ag04 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:50] "GET /api/anomalies?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:50] "GET /api/performance?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:50] "GET /api/coordinates?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:52] "GET /api/airfoils/ag03 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:52] "GET /api/performance?airfoil_id=ag03&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:52] "GET /api/coordinates?airfoil_id=ag03&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:52] "GET /api/anomalies?airfoil_id=ag03&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:53] "GET /api/airfoils/ag04 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:53] "GET /api/performance?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:53] "GET /api/coordinates?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:53] "GET /api/anomalies?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:53] "GET /api/airfoils/ag08 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:53] "GET /api/anomalies?airfoil_id=ag08&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:53] "GET /api/coordinates?airfoil_id=ag08&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:53] "GET /api/performance?airfoil_id=ag08&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:54] "GET /api/airfoils/ag10 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:54] "GET /api/coordinates?airfoil_id=ag10&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:54] "GET /api/performance?airfoil_id=ag10&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:54] "GET /api/anomalies?airfoil_id=ag10&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:56] "GET /api/airfoils/ag04 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:56] "GET /api/anomalies?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:56] "GET /api/coordinates?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:56] "GET /api/performance?airfoil_id=ag04&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:56] "GET /api/airfoils/ag09 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/performance?airfoil_id=ag09&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/coordinates?airfoil_id=ag09&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/anomalies?airfoil_id=ag09&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/airfoils/ag11 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/performance?airfoil_id=ag11&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/anomalies?airfoil_id=ag11&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/coordinates?airfoil_id=ag11&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/airfoils/ag12 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/performance?airfoil_id=ag12&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/coordinates?airfoil_id=ag12&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:27:57] "GET /api/anomalies?airfoil_id=ag12&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:28:19] "POST /api/query_logs/run HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:28:57] "GET /api/airfoils/ag10 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:28:57] "GET /api/performance?airfoil_id=ag10&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:28:57] "GET /api/coordinates?airfoil_id=ag10&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 16:28:57] "GET /api/anomalies?airfoil_id=ag10&version_id=1 HTTP/1.1" 200 -
+127.0.0.1 - - [04/Jun/2026 18:36:33] "GET /api/performance_compare?reynolds_number=50000&metric=avg_cl HTTP/1.1" 404 -
+127.0.0.1 - - [04/Jun/2026 18:36:34] "GET /api/performance_compare?reynolds_number=50000&metric=avg_cl HTTP/1.1" 404 -

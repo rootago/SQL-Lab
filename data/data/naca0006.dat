@@ -1,0 +1,246 @@
+NACA 0006
+# augmentation_status: augmented_from_real_uiuc_coordinates
+# augmentation_method: preserve_original_points_and_insert_arc_length_linear_interpolation_points
+# original_point_count: 35
+# final_point_count: 120
+# point labels: each coordinate is preceded by point_type; real means original file coordinate, augmented means inserted interpolation coordinate
+# point_type: real; original_order: 1
+1.0000000 0.0006300
+# point_type: augmented; method: linear_interpolation; between_original: 1-2; t: 0.333333
+0.9833333 0.0017633
+# point_type: augmented; method: linear_interpolation; between_original: 1-2; t: 0.666667
+0.9666667 0.0028967
+# point_type: real; original_order: 2
+0.9500000 0.0040300
+# point_type: augmented; method: linear_interpolation; between_original: 2-3; t: 0.333333
+0.9333333 0.0051000
+# point_type: augmented; method: linear_interpolation; between_original: 2-3; t: 0.666667
+0.9166667 0.0061700
+# point_type: real; original_order: 3
+0.9000000 0.0072400
+# point_type: augmented; method: linear_interpolation; between_original: 3-4; t: 0.166667
+0.8833333 0.0082200
+# point_type: augmented; method: linear_interpolation; between_original: 3-4; t: 0.333333
+0.8666667 0.0092000
+# point_type: augmented; method: linear_interpolation; between_original: 3-4; t: 0.500000
+0.8500000 0.0101800
+# point_type: augmented; method: linear_interpolation; between_original: 3-4; t: 0.666667
+0.8333333 0.0111600
+# point_type: augmented; method: linear_interpolation; between_original: 3-4; t: 0.833333
+0.8166667 0.0121400
+# point_type: real; original_order: 4
+0.8000000 0.0131200
+# point_type: augmented; method: linear_interpolation; between_original: 4-5; t: 0.166667
+0.7833333 0.0139867
+# point_type: augmented; method: linear_interpolation; between_original: 4-5; t: 0.333333
+0.7666667 0.0148533
+# point_type: augmented; method: linear_interpolation; between_original: 4-5; t: 0.500000
+0.7500000 0.0157200
+# point_type: augmented; method: linear_interpolation; between_original: 4-5; t: 0.666667
+0.7333333 0.0165867
+# point_type: augmented; method: linear_interpolation; between_original: 4-5; t: 0.833333
+0.7166667 0.0174533
+# point_type: real; original_order: 5
+0.7000000 0.0183200
+# point_type: augmented; method: linear_interpolation; between_original: 5-6; t: 0.200000
+0.6800000 0.0192200
+# point_type: augmented; method: linear_interpolation; between_original: 5-6; t: 0.400000
+0.6600000 0.0201200
+# point_type: augmented; method: linear_interpolation; between_original: 5-6; t: 0.600000
+0.6400000 0.0210200
+# point_type: augmented; method: linear_interpolation; between_original: 5-6; t: 0.800000
+0.6200000 0.0219200
+# point_type: real; original_order: 6
+0.6000000 0.0228200
+# point_type: augmented; method: linear_interpolation; between_original: 6-7; t: 0.200000
+0.5800000 0.0235500
+# point_type: augmented; method: linear_interpolation; between_original: 6-7; t: 0.400000
+0.5600000 0.0242800
+# point_type: augmented; method: linear_interpolation; between_original: 6-7; t: 0.600000
+0.5400000 0.0250100
+# point_type: augmented; method: linear_interpolation; between_original: 6-7; t: 0.800000
+0.5200000 0.0257400
+# point_type: real; original_order: 7
+0.5000000 0.0264700
+# point_type: augmented; method: linear_interpolation; between_original: 7-8; t: 0.200000
+0.4800000 0.0269800
+# point_type: augmented; method: linear_interpolation; between_original: 7-8; t: 0.400000
+0.4600000 0.0274900
+# point_type: augmented; method: linear_interpolation; between_original: 7-8; t: 0.600000
+0.4400000 0.0280000
+# point_type: augmented; method: linear_interpolation; between_original: 7-8; t: 0.800000
+0.4200000 0.0285100
+# point_type: real; original_order: 8
+0.4000000 0.0290200
+# point_type: augmented; method: linear_interpolation; between_original: 8-9; t: 0.200000
+0.3800000 0.0292180
+# point_type: augmented; method: linear_interpolation; between_original: 8-9; t: 0.400000
+0.3600000 0.0294160
+# point_type: augmented; method: linear_interpolation; between_original: 8-9; t: 0.600000
+0.3400000 0.0296140
+# point_type: augmented; method: linear_interpolation; between_original: 8-9; t: 0.800000
+0.3200000 0.0298120
+# point_type: real; original_order: 9
+0.3000000 0.0300100
+# point_type: augmented; method: linear_interpolation; between_original: 9-10; t: 0.333333
+0.2833333 0.0299100
+# point_type: augmented; method: linear_interpolation; between_original: 9-10; t: 0.666667
+0.2666667 0.0298100
+# point_type: real; original_order: 10
+0.2500000 0.0297100
+# point_type: augmented; method: linear_interpolation; between_original: 10-11; t: 0.333333
+0.2333333 0.0293700
+# point_type: augmented; method: linear_interpolation; between_original: 10-11; t: 0.666667
+0.2166667 0.0290300
+# point_type: real; original_order: 11
+0.2000000 0.0286900
+# point_type: augmented; method: linear_interpolation; between_original: 11-12; t: 0.333333
+0.1833333 0.0280367
+# point_type: augmented; method: linear_interpolation; between_original: 11-12; t: 0.666667
+0.1666667 0.0273833
+# point_type: real; original_order: 12
+0.1500000 0.0267300
+# point_type: augmented; method: linear_interpolation; between_original: 12-13; t: 0.333333
+0.1333333 0.0256233
+# point_type: augmented; method: linear_interpolation; between_original: 12-13; t: 0.666667
+0.1166667 0.0245167
+# point_type: real; original_order: 13
+0.1000000 0.0234100
+# point_type: augmented; method: linear_interpolation; between_original: 13-14; t: 0.500000
+0.0875000 0.0222050
+# point_type: real; original_order: 14
+0.0750000 0.0210000
+# point_type: augmented; method: linear_interpolation; between_original: 14-15; t: 0.500000
+0.0625000 0.0193850
+# point_type: real; original_order: 15
+0.0500000 0.0177700
+# point_type: augmented; method: linear_interpolation; between_original: 15-16; t: 0.500000
+0.0375000 0.0154200
+# point_type: real; original_order: 16
+0.0250000 0.0130700
+# point_type: augmented; method: linear_interpolation; between_original: 16-17; t: 0.500000
+0.0187500 0.0112700
+# point_type: real; original_order: 17
+0.0125000 0.0094700
+# point_type: augmented; method: linear_interpolation; between_original: 17-18; t: 0.500000
+0.0062500 0.0047350
+# point_type: real; original_order: 18
+0.0000000 0.0000000
+# point_type: augmented; method: linear_interpolation; between_original: 18-19; t: 0.500000
+0.0062500 -0.0047350
+# point_type: real; original_order: 19
+0.0125000 -0.0094700
+# point_type: augmented; method: linear_interpolation; between_original: 19-20; t: 0.500000
+0.0187500 -0.0112700
+# point_type: real; original_order: 20
+0.0250000 -0.0130700
+# point_type: augmented; method: linear_interpolation; between_original: 20-21; t: 0.500000
+0.0375000 -0.0154200
+# point_type: real; original_order: 21
+0.0500000 -0.0177700
+# point_type: augmented; method: linear_interpolation; between_original: 21-22; t: 0.500000
+0.0625000 -0.0193850
+# point_type: real; original_order: 22
+0.0750000 -0.0210000
+# point_type: augmented; method: linear_interpolation; between_original: 22-23; t: 0.500000
+0.0875000 -0.0222050
+# point_type: real; original_order: 23
+0.1000000 -0.0234100
+# point_type: augmented; method: linear_interpolation; between_original: 23-24; t: 0.333333
+0.1166667 -0.0245167
+# point_type: augmented; method: linear_interpolation; between_original: 23-24; t: 0.666667
+0.1333333 -0.0256233
+# point_type: real; original_order: 24
+0.1500000 -0.0267300
+# point_type: augmented; method: linear_interpolation; between_original: 24-25; t: 0.333333
+0.1666667 -0.0273833
+# point_type: augmented; method: linear_interpolation; between_original: 24-25; t: 0.666667
+0.1833333 -0.0280367
+# point_type: real; original_order: 25
+0.2000000 -0.0286900
+# point_type: augmented; method: linear_interpolation; between_original: 25-26; t: 0.333333
+0.2166667 -0.0290300
+# point_type: augmented; method: linear_interpolation; between_original: 25-26; t: 0.666667
+0.2333333 -0.0293700
+# point_type: real; original_order: 26
+0.2500000 -0.0297100
+# point_type: augmented; method: linear_interpolation; between_original: 26-27; t: 0.333333
+0.2666667 -0.0298100
+# point_type: augmented; method: linear_interpolation; between_original: 26-27; t: 0.666667
+0.2833333 -0.0299100
+# point_type: real; original_order: 27
+0.3000000 -0.0300100
+# point_type: augmented; method: linear_interpolation; between_original: 27-28; t: 0.200000
+0.3200000 -0.0298120
+# point_type: augmented; method: linear_interpolation; between_original: 27-28; t: 0.400000
+0.3400000 -0.0296140
+# point_type: augmented; method: linear_interpolation; between_original: 27-28; t: 0.600000
+0.3600000 -0.0294160
+# point_type: augmented; method: linear_interpolation; between_original: 27-28; t: 0.800000
+0.3800000 -0.0292180
+# point_type: real; original_order: 28
+0.4000000 -0.0290200
+# point_type: augmented; method: linear_interpolation; between_original: 28-29; t: 0.200000
+0.4200000 -0.0285100
+# point_type: augmented; method: linear_interpolation; between_original: 28-29; t: 0.400000
+0.4400000 -0.0280000
+# point_type: augmented; method: linear_interpolation; between_original: 28-29; t: 0.600000
+0.4600000 -0.0274900
+# point_type: augmented; method: linear_interpolation; between_original: 28-29; t: 0.800000
+0.4800000 -0.0269800
+# point_type: real; original_order: 29
+0.5000000 -0.0264700
+# point_type: augmented; method: linear_interpolation; between_original: 29-30; t: 0.200000
+0.5200000 -0.0257400
+# point_type: augmented; method: linear_interpolation; between_original: 29-30; t: 0.400000
+0.5400000 -0.0250100
+# point_type: augmented; method: linear_interpolation; between_original: 29-30; t: 0.600000
+0.5600000 -0.0242800
+# point_type: augmented; method: linear_interpolation; between_original: 29-30; t: 0.800000
+0.5800000 -0.0235500
+# point_type: real; original_order: 30
+0.6000000 -0.0228200
+# point_type: augmented; method: linear_interpolation; between_original: 30-31; t: 0.200000
+0.6200000 -0.0219200
+# point_type: augmented; method: linear_interpolation; between_original: 30-31; t: 0.400000
+0.6400000 -0.0210200
+# point_type: augmented; method: linear_interpolation; between_original: 30-31; t: 0.600000
+0.6600000 -0.0201200
+# point_type: augmented; method: linear_interpolation; between_original: 30-31; t: 0.800000
+0.6800000 -0.0192200
+# point_type: real; original_order: 31
+0.7000000 -0.0183200
+# point_type: augmented; method: linear_interpolation; between_original: 31-32; t: 0.200000
+0.7200000 -0.0172800
+# point_type: augmented; method: linear_interpolation; between_original: 31-32; t: 0.400000
+0.7400000 -0.0162400
+# point_type: augmented; method: linear_interpolation; between_original: 31-32; t: 0.600000
+0.7600000 -0.0152000
+# point_type: augmented; method: linear_interpolation; between_original: 31-32; t: 0.800000
+0.7800000 -0.0141600
+# point_type: real; original_order: 32
+0.8000000 -0.0131200
+# point_type: augmented; method: linear_interpolation; between_original: 32-33; t: 0.166667
+0.8166667 -0.0121400
+# point_type: augmented; method: linear_interpolation; between_original: 32-33; t: 0.333333
+0.8333333 -0.0111600
+# point_type: augmented; method: linear_interpolation; between_original: 32-33; t: 0.500000
+0.8500000 -0.0101800
+# point_type: augmented; method: linear_interpolation; between_original: 32-33; t: 0.666667
+0.8666667 -0.0092000
+# point_type: augmented; method: linear_interpolation; between_original: 32-33; t: 0.833333
+0.8833333 -0.0082200
+# point_type: real; original_order: 33
+0.9000000 -0.0072400
+# point_type: augmented; method: linear_interpolation; between_original: 33-34; t: 0.333333
+0.9166667 -0.0061700
+# point_type: augmented; method: linear_interpolation; between_original: 33-34; t: 0.666667
+0.9333333 -0.0051000
+# point_type: real; original_order: 34
+0.9500000 -0.0040300
+# point_type: augmented; method: linear_interpolation; between_original: 34-35; t: 0.333333
+0.9666667 -0.0028967
+# point_type: augmented; method: linear_interpolation; between_original: 34-35; t: 0.666667
+0.9833333 -0.0017633
+# point_type: real; original_order: 35
+1.0000000 -0.0006300

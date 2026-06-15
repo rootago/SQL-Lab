@@ -1,0 +1,71 @@
+airfoil_id,version_id,version_type,coordinate_source_type,description
+ag03,1,imported_raw,real_only,Original UIUC coordinate file
+ag04,1,imported_raw,real_only,Original UIUC coordinate file
+ag08,1,imported_raw,real_only,Original UIUC coordinate file
+ag09,1,imported_raw,real_only,Original UIUC coordinate file
+ag10,1,imported_raw,real_only,Original UIUC coordinate file
+ag11,1,imported_raw,real_only,Original UIUC coordinate file
+ag12,1,imported_raw,real_only,Original UIUC coordinate file
+ag13,1,imported_raw,real_only,Original UIUC coordinate file
+ag14,1,imported_raw,real_only,Original UIUC coordinate file
+ag16,1,imported_raw,real_only,Original UIUC coordinate file
+aquilasm,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+b737a,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+b737b,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+b737c,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+b737d,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+clarky,1,imported_raw,real_only,Original UIUC coordinate file
+clarkyh,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+clarkysm,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+dae11,1,imported_raw,real_only,Original UIUC coordinate file
+du8608418,1,imported_raw,real_only,Original UIUC coordinate file
+e193,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+e205,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+e374,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+e387,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+e392,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+e593,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+e664,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+fx60126,1,imported_raw,real_only,Original UIUC coordinate file
+fx61184,1,imported_raw,real_only,Original UIUC coordinate file
+fx63137,1,imported_raw,real_only,Original UIUC coordinate file
+fx66196v,1,imported_raw,real_only,Original UIUC coordinate file
+fx67k150,1,imported_raw,real_only,Original UIUC coordinate file
+fx71l150,1,imported_raw,real_only,Original UIUC coordinate file
+fx74cl5140,1,imported_raw,real_only,Original UIUC coordinate file
+fx79k144,1,imported_raw,real_only,Original UIUC coordinate file
+goe398,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+l1003,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+lrn1015,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+mh114,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+mh32,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+mh45,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+n0009sm,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+n0012,1,imported_raw,real_only,Original UIUC coordinate file
+n63212,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+n64212,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca0006,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca0015,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca0018,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca23012,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca23015,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca23018,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca23021,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca2412,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca2415,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca4412,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+naca4415,1,imported_raw,real_only,Original UIUC coordinate file
+naca6412,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+raf15,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+raf19,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+rg14,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+rg15,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+s1223,1,imported_raw,real_only,Original UIUC coordinate file
+s3010,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+s3021,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+s4061,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+s8052,1,imported_raw,real_only,Original UIUC coordinate file
+sd7003,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+sd7037,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+sm701,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points
+tsagi12,1,augmented_from_raw,mixed_real_and_augmented,Original UIUC coordinates with inserted interpolation points

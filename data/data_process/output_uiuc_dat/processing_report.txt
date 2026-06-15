@@ -1,0 +1,14 @@
+UIUC .dat processing report
+airfoil_count=70
+coordinate_count=8552
+augmented_coordinate_count=3054
+performance_count=4200
+anomaly_count=39
+reynolds_numbers=50000,100000,200000,500000
+alpha_degrees=-10,-8,-6,-4,-2,0,2,4,6,8,10,12,14,16,18
+
+Notes:
+- Coordinates marked real come from the .dat file's original coordinate rows.
+- Coordinates marked augmented are inserted interpolation points already labelled in data/*.dat.
+- Performance records are generated for database-course experiments and are not CFD or wind-tunnel data.
+- Anomaly rows are intentionally injected and tracked in anomalies.csv.

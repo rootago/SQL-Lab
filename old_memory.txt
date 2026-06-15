@@ -1,0 +1,343 @@
+用户附件
+可视化要标号数据值，我鼠标进去能够在旁边呈现数据值
+6月4日 17:21
+
+已处理 2m 25s
+已加上交互数据值提示：
+
+二维轮廓图：
+
+鼠标靠近点时显示 point_order / x / y / surface / source
+图上每隔 10 个点标一个小点，增强可定位性
+augmented 点会用不同颜色标出
+CL-alpha 曲线：
+
+鼠标靠近点时显示 alpha / Re / CL / CD / CM
+如果是异常点，会显示 anomaly: yes
+提示框会跟着鼠标附近显示，离开图表自动隐藏。
+
+检查已过：
+
+syntax_ok
+import_ok
+重启 Flask 后 Ctrl+F5，在两个图上移动鼠标测试。
+
+
+已编辑 app.py
++18
+-6
+6月4日 17:23
+用户附件
+2乘3->1乘6
+6月4日 17:23
+
+已处理 44s
+已改成 1 × 6：
+
+.metrics {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+窄屏下保留响应式，自动变成 2 列，避免挤坏。
+
+检查已过：
+
+syntax_ok
+import_ok
+
+已编辑 app.py
++2
+-2
+6月4日 17:24
+用户附件
+用户附件
+cd与alpha没做，cl/cd与alpha没做；多个翼型在同一 Re 下的性能对比图和左边栏选取飞机类型无关，直接画一个大大柱状图常驻在下面（随着飞机类型切换不改变），可以做几个选择，多个性能参数的对比，可以通过按钮切换
+6月4日 17:24
+
+已处理 4m 39s
+已补上这些可视化：
+
+当前翼型：
+
+CL-alpha
+CD-alpha
+CL/CD-alpha
+都跟随当前 Re 切换，并支持鼠标悬停显示数据值。
+全局常驻柱状图：
+
+同一 Re 下多翼型性能对比
+不随左侧翼型切换改变。
+可选 Re。
+可切换指标：最大 CL、最小 CD、最大 CL/CD、平均 CL。
+版本差异图：
+
+如果当前翼型有多个版本，显示各版本在当前 Re 下的最大 CL/CD 对比。
+如果只有一个版本，会显示暂无版本差异。
+新增后端接口：
+
+/api/performance_compare
+检查已过：
+
+syntax_ok
+import_ok
+重启 Flask 后 Ctrl+F5。
+
+
+已编辑 app.py
++57
+-9
+6月4日 17:29
+请你写一个比较完整的Transcation实验设置
+星期五00:02
+下面这份可以直接放进实验报告/PPT，标题建议写 Transaction 实验设计。
+
+Transaction 实验设置
+
+本实验围绕数据库事务的 ACID 特性展开，重点验证事务的原子性、一致性和并发控制。系统中已设计 performance_records、airfoils、data_versions 等核心表，并设置了主键、外键和 CHECK 约束，因此可以通过真实业务操作来观察事务提交、回滚和并发锁等待现象。
+
+实验入口设置在前端的 事务实验 页面中，仅 engineer/admin 用户可访问。普通用户不能执行事务实验，避免误修改数据库。事务实验支持多条 SQL 语句，由后端在同一个 MySQL connection 中执行：
+
+START TRANSACTION
+执行 SQL 1
+执行 SQL 2
+...
+COMMIT 或 ROLLBACK
+如果任意一条 SQL 执行失败，后端自动执行 ROLLBACK，并将本次事务记录到 query_logs 中。
+
+场景一：两个用户同时修改同一条性能记录
+
+实验目标：观察并发事务下 InnoDB 行级锁的行为。
+
+实验设置：
+
+User A 和 User B 同时修改 performance_records 中同一条记录。
+User A 先开始事务并更新该记录，但暂不提交。
+User B 随后尝试更新同一条记录。
+实验过程：
+
+1. 后端创建一条测试性能记录 perf_id = 9100001。
+2. User A 开启事务，执行 UPDATE，并持有行锁约 2 秒。
+3. User B 开启事务，尝试 UPDATE 同一条记录。
+4. User B 被阻塞，等待 User A 提交。
+5. User A COMMIT 后，User B 才能继续执行并 COMMIT。
+实验现象：
+
+User B 的 UPDATE 执行时间明显更长。
+最终记录值以后提交的事务为准。
+体现的数据库特性：
+
+Isolation 隔离性：
+两个事务同时修改同一行时，InnoDB 使用行级锁保证数据不会被同时写坏。
+
+Concurrency Control 并发控制：
+后到达的事务需要等待先到达的事务释放锁。
+场景二：批量导入性能数据，其中一条非法导致整批回滚
+
+实验目标：验证事务的原子性和约束一致性。
+
+实验 SQL：
+
+INSERT INTO performance_records
+(perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+VALUES
+(9000001, 'ag03', 1, 0, 123456, 0.5, 0.01, 0.0, 'generated_synthetic', 0);
+
+INSERT INTO performance_records
+(perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+VALUES
+(9000002, 'ag03', 1, 99, 123456, 0.6, 0.02, 0.0, 'generated_synthetic', 0);
+其中第二条记录的：
+
+alpha_deg = 99
+违反了表约束：
+
+CHECK (alpha_deg >= -20 AND alpha_deg <= 25)
+实验过程：
+
+1. 开启事务。
+2. 插入第一条合法性能记录。
+3. 插入第二条非法性能记录。
+4. 第二条触发 CHECK 约束错误。
+5. 后端自动 ROLLBACK。
+验证 SQL：
+
+SELECT *
+FROM performance_records
+WHERE perf_id IN (9000001, 9000002);
+预期结果：
+
+查询结果为空。
+第一条虽然已经执行过，但由于第二条失败，整批事务被回滚。
+体现的数据库特性：
+
+Atomicity 原子性：
+事务中的操作要么全部成功，要么全部失败。
+
+Consistency 一致性：
+CHECK 约束阻止非法性能数据进入数据库。
+场景三：更新翼型主表和版本表时必须同时成功或同时失败
+
+实验目标：验证跨表更新时事务的一致性。
+
+实验 SQL：
+
+UPDATE airfoils
+SET family = 'Version Atomic Test'
+WHERE airfoil_id = 'ag03';
+
+UPDATE data_versions
+SET version_type = 'bad_version_type'
+WHERE airfoil_id = 'ag03' AND version_id = 1;
+其中第二条 SQL 违反 data_versions 表约束：
+
+CHECK (version_type IN ('imported_raw', 'augmented_from_raw'))
+实验过程：
+
+1. 开启事务。
+2. 先更新 airfoils 主表中的 family 字段。
+3. 再更新 data_versions 中的 version_type。
+4. 第二条 SQL 由于非法 version_type 失败。
+5. 后端自动 ROLLBACK。
+验证 SQL：
+
+SELECT a.airfoil_id, a.family, v.version_id, v.version_type
+FROM airfoils a
+JOIN data_versions v ON v.airfoil_id = a.airfoil_id
+WHERE a.airfoil_id = 'ag03' AND v.version_id = 1;
+预期结果：
+
+airfoils.family 不会变成 'Version Atomic Test'。
+data_versions.version_type 也不会变成非法值。
+两个表保持原状态。
+体现的数据库特性：
+
+Atomicity 原子性：
+跨表更新必须作为一个整体成功或失败。
+
+Consistency 一致性：
+版本表的 CHECK 约束保证版本类型合法。
+
+Referential Integrity 参照完整性：
+data_versions 是 airfoils 的弱实体，依赖 airfoils，因此跨表操作必须保持一致。
+事务实验总结
+
+本实验共设置三个事务场景：
+
+1. 并发修改同一条性能记录：
+   验证行级锁和事务隔离性。
+
+2. 批量导入性能数据失败回滚：
+   验证事务原子性和 CHECK 约束一致性。
+
+3. 主表与版本表同时更新失败回滚：
+   验证跨表事务的一致性。
+实验结论：
+
+数据库事务可以保证复杂操作在异常情况下不会留下半完成状态。
+当事务中的任意一步失败时，ROLLBACK 会撤销之前已经执行的修改。
+在并发场景中，InnoDB 通过行级锁控制多个用户对同一数据的写入顺序。
+前端系统中，所有事务实验均会被写入 query_logs，用于后续日志实验和审计分析。
+
+星期五00:03
+实验报告设置，文字给我，方便我们扩展
+星期五00:03
+下面这版可以直接放进实验报告，后续你们可以继续往里面加截图、SQL 执行结果和现象分析。
+
+事务实验设置
+
+本实验用于验证数据库事务在实际业务场景中的作用。项目数据库以翼型数据为核心，包含 airfoils、data_versions、performance_records、anomaly_records 等表。其中，performance_records 保存翼型在不同迎角和雷诺数下的气动性能数据，data_versions 作为 airfoils 的弱实体记录不同版本信息。数据库中设置了主键、外键、唯一约束和 CHECK 约束，因此适合用于观察事务提交、失败回滚以及并发控制现象。
+
+事务实验功能集成在前端系统的 事务实验 页面中。该页面仅允许具有 engineer 或 admin 权限的用户访问，普通只读用户无法执行事务操作。这样既符合权限控制要求，也避免普通用户误修改数据库。
+
+后端执行事务时，不是简单地逐条执行 SQL，而是在同一个 MySQL 连接中完成完整事务流程：
+
+START TRANSACTION
+执行多条 SQL
+如果全部成功，则 COMMIT
+如果任意一步失败，则 ROLLBACK
+因此，本实验可以保证多条 SQL 语句处于同一个事务上下文中，能够真实体现事务的原子性、一致性和隔离性。
+
+本项目设置了三个事务实验场景：
+
+场景一：两个用户同时修改同一条性能记录。
+场景二：批量导入一组性能数据，其中一条非法导致整批回滚。
+场景三：更新翼型主表和版本表时，要求两个表必须同时成功或同时失败。
+场景一：两个用户同时修改同一条性能记录
+
+该实验用于模拟并发环境下多个用户同时修改同一条数据的情况。后端创建两个独立的 MySQL 连接，分别模拟 User A 和 User B。
+
+实验过程如下：
+
+1. User A 开启事务，并修改 performance_records 中某一条性能记录。
+2. User A 暂不提交事务，而是持有该行记录的锁。
+3. User B 开启另一个事务，并尝试修改同一条 performance_records 记录。
+4. 由于该记录已经被 User A 锁定，User B 的 UPDATE 操作会等待。
+5. User A 提交事务后，User B 才能继续执行并提交。
+该实验主要观察的是 InnoDB 的行级锁机制。实验现象中，User B 的执行时间会明显长于普通更新操作，说明它在等待 User A 释放锁。
+
+该场景体现了事务的 隔离性 Isolation。当多个事务并发修改同一条记录时，数据库通过锁机制避免数据被同时写入，从而保证数据的一致性。
+
+场景二：批量导入性能数据失败回滚
+
+该实验用于验证事务的原子性。实验中连续插入两条性能记录，其中第一条是合法数据，第二条是非法数据。
+
+示例 SQL 如下：
+
+INSERT INTO performance_records
+(perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+VALUES
+(9000001, 'ag03', 1, 0, 123456, 0.5, 0.01, 0.0, 'generated_synthetic', 0);
+
+INSERT INTO performance_records
+(perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+VALUES
+(9000002, 'ag03', 1, 99, 123456, 0.6, 0.02, 0.0, 'generated_synthetic', 0);
+其中第二条记录的 alpha_deg = 99，违反了 performance_records 表中的检查约束：
+
+CHECK (alpha_deg >= -20 AND alpha_deg <= 25)
+实验预期结果是：第二条插入失败后，整个事务回滚。虽然第一条记录本身合法，并且在事务中已经执行过插入操作，但由于事务整体失败，第一条记录也不会被真正写入数据库。
+
+验证 SQL：
+
+SELECT *
+FROM performance_records
+WHERE perf_id IN (9000001, 9000002);
+预期查询结果为空。
+
+该场景体现了事务的 原子性 Atomicity：事务中的多个操作要么全部成功，要么全部失败，不会出现只完成一部分的情况。同时，CHECK 约束保证了数据的一致性。
+
+场景三：主表与版本表同时成功或同时失败
+
+该实验用于验证跨表更新时事务的一致性。项目中 data_versions 是 airfoils 的弱实体，版本记录依赖于具体翼型。因此，当系统更新翼型信息和版本信息时，应保证两个表的修改处于同一个事务中。
+
+示例 SQL 如下：
+
+UPDATE airfoils
+SET family = 'Version Atomic Test'
+WHERE airfoil_id = 'ag03';
+
+UPDATE data_versions
+SET version_type = 'bad_version_type'
+WHERE airfoil_id = 'ag03' AND version_id = 1;
+其中第二条 SQL 将 version_type 设置为非法值，违反 data_versions 表的检查约束：
+
+CHECK (version_type IN ('imported_raw', 'augmented_from_raw'))
+实验预期结果是：第二条更新失败后，整个事务回滚。也就是说，第一条对 airfoils.family 的修改不会被保留，data_versions.version_type 也不会被改成非法值。
+
+验证 SQL：
+
+SELECT a.airfoil_id, a.family, v.version_id, v.version_type
+FROM airfoils a
+JOIN data_versions v ON v.airfoil_id = a.airfoil_id
+WHERE a.airfoil_id = 'ag03' AND v.version_id = 1;
+该场景体现了事务在跨表操作中的作用。对于存在实体依赖关系的数据表，事务可以保证多个表之间的数据不会出现半更新状态。
+
+实验总结
+
+本实验通过三个场景验证了事务机制在数据库系统中的重要作用。
+
+场景一说明了并发事务下的行级锁和隔离性。
+场景二说明了批量操作失败时事务可以整体回滚。
+场景三说明了跨表更新时事务可以保证主表和从属表的一致性。
+实验结果表明，事务可以有效保证数据库操作的可靠性。当多个 SQL 操作共同构成一个业务逻辑时，应将它们放入同一个事务中执行。这样即使中途发生错误，也可以通过 ROLLBACK 恢复到事务开始前的状态，避免数据库中出现不完整或不一致的数据。
+
+此外，系统会将每次事务实验记录到 query_logs 表中，包括执行用户、SQL 内容、执行是否合法以及执行时间。这为后续日志实验、权限审计和事务分析提供了数据基础。

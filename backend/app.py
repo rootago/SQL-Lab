@@ -1,0 +1,5698 @@
+from __future__ import annotations
+
+import os
+import queue
+import re
+import threading
+import time
+import json
+from typing import Any
+
+import pymysql
+from flask import Flask, jsonify, render_template_string, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
+
+
+DEFAULT_DATABASE = "airfoil_engineering_db"
+
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-only-change-this-secret")
+
+_AUTH_SCHEMA_READY = False
+_SAVED_TRANSACTION_SCHEMA_READY = False
+_LINEAGE_SCHEMA_READY = False
+_IMPORT_SCHEMA_READY = False
+_SOFT_DELETE_SCHEMA_READY = False
+_ANOMALY_TRIGGER_SCHEMA_READY = False
+_PERFORMANCE_TRIGGER_SCHEMA_READY = False
+_CORE_TRIGGER_SCHEMA_READY = False
+_STORED_PROCEDURE_SCHEMA_READY = False
+PASSWORD_HASH_METHOD = os.getenv("PASSWORD_HASH_METHOD", "pbkdf2:sha256:60000")
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "8"))
+_DB_POOL: queue.LifoQueue[pymysql.connections.Connection] = queue.LifoQueue(maxsize=DB_POOL_SIZE)
+
+
+def db_config() -> dict[str, Any]:
+    return {
+        "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
+        "port": int(os.getenv("MYSQL_PORT", "3306")),
+        "user": os.getenv("MYSQL_USER", "root"),
+        "password": os.getenv("MYSQL_PASSWORD", ""),
+        "database": os.getenv("MYSQL_DATABASE", DEFAULT_DATABASE),
+        "charset": "utf8mb4",
+        "cursorclass": pymysql.cursors.DictCursor,
+    }
+
+
+def make_password_hash(password: str) -> str:
+    return generate_password_hash(password, method=PASSWORD_HASH_METHOD)
+
+
+def get_db_connection() -> pymysql.connections.Connection:
+    try:
+        conn = _DB_POOL.get_nowait()
+        conn.ping(reconnect=True)
+        return conn
+    except queue.Empty:
+        return pymysql.connect(**db_config(), autocommit=False)
+
+
+def release_db_connection(conn: pymysql.connections.Connection) -> None:
+    try:
+        conn.rollback()
+        _DB_POOL.put_nowait(conn)
+    except queue.Full:
+        conn.close()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def query_all(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+    finally:
+        release_db_connection(conn)
+
+
+def query_result_sets(sql: str, params: tuple[Any, ...] = ()) -> list[list[dict[str, Any]]]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            result_sets = [list(cur.fetchall())]
+            while cur.nextset():
+                if cur.description:
+                    result_sets.append(list(cur.fetchall()))
+        return result_sets
+    finally:
+        release_db_connection(conn)
+
+
+def execute_write(sql: str, params: tuple[Any, ...] = ()) -> int:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            affected = cur.execute(sql, params)
+        conn.commit()
+        return int(affected)
+    finally:
+        release_db_connection(conn)
+
+
+def execute_write_return_id(sql: str, params: tuple[Any, ...] = ()) -> int:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            new_id = cur.lastrowid
+        conn.commit()
+        return int(new_id)
+    finally:
+        release_db_connection(conn)
+
+
+def log_user_action(
+    user_id: int,
+    natural_language: str | None,
+    sql_text: str,
+    is_valid: int,
+    execution_time_ms: int = 0,
+) -> None:
+    execute_write(
+        """
+        INSERT INTO query_logs
+            (user_id, natural_language, sql_text, is_ai_generated, is_valid, execution_time_ms)
+        VALUES (%s, %s, %s, 0, %s, %s)
+        """,
+        (user_id, natural_language, sql_text, is_valid, execution_time_ms),
+    )
+
+
+def mark_lineage_modified(
+    table_name: str,
+    record_pk: str,
+    airfoil_id: str | None,
+    source_version: str,
+    user: dict[str, Any],
+) -> None:
+    execute_write(
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, previous_record_version_id, is_modified,
+             last_modified_at, modified_by_user_id, modified_by_username, modified_count, last_operation)
+        VALUES
+            (%s, %s, %s, %s, 1, 0, 1, CURRENT_TIMESTAMP, %s, %s, 1, 'UPDATE')
+        ON DUPLICATE KEY UPDATE
+            airfoil_id = VALUES(airfoil_id),
+            source_version = VALUES(source_version),
+            previous_record_version_id = record_version_id,
+            record_version_id = record_version_id + 1,
+            is_modified = 1,
+            last_modified_at = CURRENT_TIMESTAMP,
+            modified_by_user_id = VALUES(modified_by_user_id),
+            modified_by_username = VALUES(modified_by_username),
+            modified_count = modified_count + 1,
+            last_operation = 'UPDATE'
+        """,
+        (table_name, record_pk, airfoil_id, source_version, user["user_id"], user["username"]),
+    )
+
+
+def mark_lineage_deleted(
+    table_name: str,
+    record_pk: str,
+    airfoil_id: str | None,
+    source_version: str,
+    user: dict[str, Any],
+) -> None:
+    ensure_lineage_schema()
+    execute_write(
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, previous_record_version_id, is_modified,
+             last_modified_at, modified_by_user_id, modified_by_username, modified_count, last_operation)
+        VALUES
+            (%s, %s, %s, %s, 1, 0, 1, CURRENT_TIMESTAMP, %s, %s, 1, 'DELETE')
+        ON DUPLICATE KEY UPDATE
+            airfoil_id = VALUES(airfoil_id),
+            source_version = VALUES(source_version),
+            previous_record_version_id = record_version_id,
+            record_version_id = record_version_id + 1,
+            is_modified = 1,
+            last_modified_at = CURRENT_TIMESTAMP,
+            modified_by_user_id = VALUES(modified_by_user_id),
+            modified_by_username = VALUES(modified_by_username),
+            modified_count = modified_count + 1,
+            last_operation = 'DELETE'
+        """,
+        (table_name, record_pk, airfoil_id, source_version, user["user_id"], user["username"]),
+    )
+
+
+def mark_lineage_restored(
+    table_name: str,
+    record_pk: str,
+    airfoil_id: str | None,
+    source_version: str,
+    user: dict[str, Any],
+) -> None:
+    ensure_lineage_schema()
+    execute_write(
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, previous_record_version_id, is_modified,
+             last_modified_at, modified_by_user_id, modified_by_username, modified_count, last_operation)
+        VALUES
+            (%s, %s, %s, %s, 1, 0, 1, CURRENT_TIMESTAMP, %s, %s, 1, 'RESTORE')
+        ON DUPLICATE KEY UPDATE
+            airfoil_id = VALUES(airfoil_id),
+            source_version = VALUES(source_version),
+            previous_record_version_id = record_version_id,
+            record_version_id = record_version_id + 1,
+            is_modified = 1,
+            last_modified_at = CURRENT_TIMESTAMP,
+            modified_by_user_id = VALUES(modified_by_user_id),
+            modified_by_username = VALUES(modified_by_username),
+            modified_count = modified_count + 1,
+            last_operation = 'RESTORE'
+        """,
+        (table_name, record_pk, airfoil_id, source_version, user["user_id"], user["username"]),
+    )
+
+
+def mark_lineage_insert(
+    table_name: str,
+    record_pk: str,
+    airfoil_id: str | None,
+    source_version: str,
+) -> None:
+    ensure_lineage_schema()
+    execute_write(
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        VALUES (%s, %s, %s, %s, 0, 0, 'INSERT')
+        ON DUPLICATE KEY UPDATE
+            airfoil_id = VALUES(airfoil_id),
+            source_version = VALUES(source_version),
+            last_operation = IF(is_modified = 1, last_operation, 'INSERT')
+        """,
+        (table_name, record_pk, airfoil_id, source_version),
+    )
+
+
+def current_record_version_id(table_name: str, record_pk: str) -> int:
+    ensure_lineage_schema()
+    rows = query_all(
+        """
+        SELECT record_version_id
+        FROM data_record_lineage
+        WHERE table_name = %s AND record_pk = %s
+        LIMIT 1
+        """,
+        (table_name, record_pk),
+    )
+    if not rows:
+        return 0
+    return int(rows[0].get("record_version_id") or 0)
+
+
+def log_data_import(
+    target_table: str,
+    record_pk: str,
+    entry_method: str,
+    user: dict[str, Any] | None,
+    airfoil_id: str | None = None,
+    version_id: int | None = None,
+    source_type: str | None = None,
+    description: str | None = None,
+) -> None:
+    execute_write(
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, airfoil_id, version_id, source_type,
+             entry_method, created_by_user_id, created_by_username, description)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            airfoil_id = VALUES(airfoil_id),
+            version_id = VALUES(version_id),
+            source_type = VALUES(source_type),
+            created_by_user_id = VALUES(created_by_user_id),
+            created_by_username = VALUES(created_by_username),
+            created_at = CURRENT_TIMESTAMP,
+            description = VALUES(description)
+        """,
+        (
+            target_table,
+            record_pk,
+            airfoil_id,
+            version_id,
+            source_type,
+            entry_method,
+            None if user is None else user.get("user_id"),
+            "system" if user is None else user.get("username"),
+            description,
+        ),
+    )
+
+
+def infer_sql_import_target(sql: str) -> tuple[str, str] | None:
+    match = re.match(r"\s*insert\s+into\s+`?([A-Za-z_][A-Za-z0-9_]*)`?", sql, re.IGNORECASE)
+    if not match:
+        return None
+    table_name = match.group(1)
+    if table_name not in {"data_sources", "airfoils", "data_versions"}:
+        return None
+    return table_name, f"sql_insert_{int(time.time() * 1000)}"
+
+
+def ensure_auth_schema() -> None:
+    global _AUTH_SCHEMA_READY
+    if _AUTH_SCHEMA_READY:
+        return
+
+    rows = query_all(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'users'
+          AND column_name = 'password_hash'
+        """
+    )
+    if rows[0]["count"] == 0:
+        execute_write("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL AFTER username")
+
+    admin_username = os.getenv("ADMIN_USERNAME")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    admin_role = os.getenv("ADMIN_ROLE", "admin")
+    if admin_username and admin_password:
+        password_hash = make_password_hash(admin_password)
+        existing = query_all("SELECT user_id FROM users WHERE username = %s", (admin_username,))
+        if existing:
+            execute_write(
+                """
+                UPDATE users
+                SET password_hash = %s, role = %s, is_active = 1
+                WHERE username = %s
+                """,
+                (password_hash, admin_role, admin_username),
+            )
+        else:
+            execute_write(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+                (admin_username, password_hash, admin_role),
+            )
+
+    _AUTH_SCHEMA_READY = True
+
+
+def ensure_saved_transaction_schema() -> None:
+    global _SAVED_TRANSACTION_SCHEMA_READY
+    if _SAVED_TRANSACTION_SCHEMA_READY:
+        return
+
+    execute_write(
+        """
+        CREATE TABLE IF NOT EXISTS saved_transactions (
+            saved_id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            title VARCHAR(128) NOT NULL,
+            sql_text TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_saved_transactions_user_title (user_id, title),
+            INDEX idx_saved_transactions_user (user_id),
+            CONSTRAINT fk_saved_transactions_user
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+                ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    _SAVED_TRANSACTION_SCHEMA_READY = True
+
+
+def ensure_lineage_schema() -> None:
+    global _LINEAGE_SCHEMA_READY
+    if _LINEAGE_SCHEMA_READY:
+        return
+    execute_write(
+        """
+        CREATE TABLE IF NOT EXISTS data_record_lineage (
+            lineage_id INT AUTO_INCREMENT PRIMARY KEY,
+            table_name VARCHAR(64) NOT NULL,
+            record_pk VARCHAR(191) NOT NULL,
+            airfoil_id VARCHAR(64),
+            source_version VARCHAR(64) NOT NULL,
+            record_version_id INT NOT NULL DEFAULT 0,
+            previous_record_version_id INT NULL,
+            written_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            is_modified TINYINT NOT NULL DEFAULT 0,
+            last_modified_at TIMESTAMP NULL,
+            modified_by_user_id INT NULL,
+            modified_by_username VARCHAR(64) NULL,
+            modified_count INT NOT NULL DEFAULT 0,
+            last_operation VARCHAR(16) NOT NULL DEFAULT 'INSERT',
+            UNIQUE KEY uq_data_record_lineage_record (table_name, record_pk),
+            INDEX idx_data_record_lineage_table (table_name),
+            INDEX idx_data_record_lineage_airfoil (airfoil_id),
+            INDEX idx_data_record_lineage_version (table_name, record_pk, record_version_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    existing_columns = {
+        row["column_name"]
+        for row in query_all(
+            """
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'data_record_lineage'
+            """
+        )
+    }
+    if "record_version_id" not in existing_columns:
+        execute_write("ALTER TABLE data_record_lineage ADD COLUMN record_version_id INT NOT NULL DEFAULT 0 AFTER source_version")
+    else:
+        execute_write("ALTER TABLE data_record_lineage MODIFY COLUMN record_version_id INT NOT NULL DEFAULT 0")
+    if "previous_record_version_id" not in existing_columns:
+        execute_write("ALTER TABLE data_record_lineage ADD COLUMN previous_record_version_id INT NULL AFTER record_version_id")
+    if "modified_by_user_id" not in existing_columns:
+        execute_write("ALTER TABLE data_record_lineage ADD COLUMN modified_by_user_id INT NULL AFTER last_modified_at")
+    if "modified_by_username" not in existing_columns:
+        execute_write("ALTER TABLE data_record_lineage ADD COLUMN modified_by_username VARCHAR(64) NULL AFTER modified_by_user_id")
+    execute_write("""
+        UPDATE data_record_lineage
+        SET record_version_id = 0,
+            previous_record_version_id = NULL
+        WHERE is_modified = 0
+          AND modified_count = 0
+          AND last_operation = 'INSERT'
+    """)
+    for sql in [
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'data_sources', source_type, NULL, 'source', 0, 0, 'INSERT'
+        FROM data_sources
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'airfoils', airfoil_id, airfoil_id, 'master', 0, 0, 'INSERT'
+        FROM airfoils
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'data_versions', CONCAT(airfoil_id, '#', version_id), airfoil_id, CONCAT('version ', version_id), 0, 0, 'INSERT'
+        FROM data_versions
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'coordinate_points', CONCAT(airfoil_id, '#', version_id, '#', point_order), airfoil_id, CONCAT('version ', version_id), 0, 0, 'INSERT'
+        FROM coordinate_points
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'performance_records', CAST(perf_id AS CHAR), airfoil_id, CONCAT('version ', version_id), 0, 0, 'INSERT'
+        FROM performance_records
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'anomaly_records', CAST(anomaly_id AS CHAR), airfoil_id, CONCAT('version ', version_id), 0, 0, 'INSERT'
+        FROM anomaly_records
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+    ]:
+        execute_write(sql)
+    _LINEAGE_SCHEMA_READY = True
+
+
+def sync_lineage_records() -> None:
+    for sql in [
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'data_sources', source_type, NULL, 'source', 0, 0, 'INSERT'
+        FROM data_sources
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'airfoils', airfoil_id, airfoil_id, 'master', 0, 0, 'INSERT'
+        FROM airfoils
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'data_versions', CONCAT(airfoil_id, '#', version_id), airfoil_id, CONCAT('version ', version_id), 0, 0, 'INSERT'
+        FROM data_versions
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'coordinate_points', CONCAT(airfoil_id, '#', version_id, '#', point_order), airfoil_id, CONCAT('version ', version_id), 0, 0, 'INSERT'
+        FROM coordinate_points
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'performance_records', CAST(perf_id AS CHAR), airfoil_id, CONCAT('version ', version_id), 0, 0, 'INSERT'
+        FROM performance_records
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+        """
+        INSERT INTO data_record_lineage
+            (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+        SELECT 'anomaly_records', CAST(anomaly_id AS CHAR), airfoil_id, CONCAT('version ', version_id), 0, 0, 'INSERT'
+        FROM anomaly_records
+        ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)
+        """,
+    ]:
+        execute_write(sql)
+
+
+def ensure_import_schema() -> None:
+    global _IMPORT_SCHEMA_READY
+    if _IMPORT_SCHEMA_READY:
+        return
+    execute_write(
+        """
+        CREATE TABLE IF NOT EXISTS data_import_records (
+            import_id INT AUTO_INCREMENT PRIMARY KEY,
+            target_table VARCHAR(64) NOT NULL,
+            record_pk VARCHAR(191) NOT NULL,
+            airfoil_id VARCHAR(64) NULL,
+            version_id INT NULL,
+            source_type VARCHAR(64) NULL,
+            entry_method VARCHAR(32) NOT NULL,
+            created_by_user_id INT NULL,
+            created_by_username VARCHAR(64) NULL,
+            description TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_data_import_record_method (target_table, record_pk, entry_method),
+            INDEX idx_data_import_target (target_table),
+            INDEX idx_data_import_airfoil (airfoil_id),
+            INDEX idx_data_import_user (created_by_user_id),
+            CHECK (entry_method IN ('system', 'frontend', 'sql'))
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    import_columns = {
+        row["column_name"]
+        for row in query_all(
+            """
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'data_import_records'
+            """
+        )
+    }
+    if "record_version_id" in import_columns:
+        execute_write("ALTER TABLE data_import_records DROP COLUMN record_version_id")
+    for sql in [
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, source_type, entry_method, created_by_username, description)
+        SELECT 'data_sources', source_type, source_type, 'system', 'system', description
+        FROM data_sources
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, airfoil_id, source_type, entry_method, created_by_username, description)
+        SELECT 'airfoils', airfoil_id, airfoil_id, source_type, 'system', 'system', CONCAT(name, ' / ', source_file)
+        FROM airfoils
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, airfoil_id, version_id, entry_method, created_by_username, description)
+        SELECT 'data_versions', CONCAT(airfoil_id, '#', version_id), airfoil_id, version_id, 'system', 'system', description
+        FROM data_versions
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+    ]:
+        execute_write(sql)
+    _IMPORT_SCHEMA_READY = True
+
+
+def sync_import_records() -> None:
+    for sql in [
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, source_type, entry_method, created_by_username, description)
+        SELECT 'data_sources', source_type, source_type, 'system', 'system', description
+        FROM data_sources
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, airfoil_id, source_type, entry_method, created_by_username, description)
+        SELECT 'airfoils', airfoil_id, airfoil_id, source_type, 'system', 'system', CONCAT(name, ' / ', source_file)
+        FROM airfoils
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, airfoil_id, version_id, entry_method, created_by_username, description)
+        SELECT 'data_versions', CONCAT(airfoil_id, '#', version_id), airfoil_id, version_id, 'system', 'system', description
+        FROM data_versions
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, airfoil_id, version_id, entry_method, created_by_username, description)
+        SELECT 'coordinate_points', CONCAT(airfoil_id, '#', version_id, '#', point_order), airfoil_id, version_id,
+               'system', 'system', CONCAT('point_order=', point_order, '; point_source=', point_source)
+        FROM coordinate_points
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, airfoil_id, version_id, source_type, entry_method, created_by_username, description)
+        SELECT 'performance_records', CAST(perf_id AS CHAR), airfoil_id, version_id, source_type,
+               'system', 'system', CONCAT('alpha=', alpha_deg, '; Re=', reynolds_number)
+        FROM performance_records
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+        """
+        INSERT INTO data_import_records
+            (target_table, record_pk, airfoil_id, version_id, entry_method, created_by_username, description)
+        SELECT 'anomaly_records', CAST(anomaly_id AS CHAR), airfoil_id, version_id,
+               'system', 'system', CONCAT('perf_id=', perf_id, '; rule=', rule_type)
+        FROM anomaly_records
+        ON DUPLICATE KEY UPDATE target_table = VALUES(target_table)
+        """,
+    ]:
+        execute_write(sql)
+    execute_write(
+        """
+        DELETE system_rows
+        FROM data_import_records AS system_rows
+        JOIN (
+            SELECT target_table, record_pk
+            FROM (
+                SELECT DISTINCT target_table, record_pk
+                FROM data_import_records
+                WHERE entry_method <> 'system'
+            ) AS user_row_keys
+        ) AS user_rows
+          ON user_rows.target_table = system_rows.target_table
+         AND user_rows.record_pk = system_rows.record_pk
+        WHERE system_rows.entry_method = 'system'
+        """
+    )
+
+
+SOFT_DELETE_TARGET_TABLES = {
+    "data_sources",
+    "airfoils",
+    "data_versions",
+    "coordinate_points",
+    "performance_records",
+    "anomaly_records",
+}
+
+BATCH_IMPORT_COLUMNS = {
+    "data_sources": ["source_type", "description"],
+    "airfoils": [
+        "airfoil_id",
+        "name",
+        "source",
+        "family",
+        "is_generated",
+        "source_type",
+        "source_file",
+        "has_augmented_coordinates",
+        "original_point_count",
+        "final_point_count",
+    ],
+    "data_versions": ["airfoil_id", "version_id", "version_type", "coordinate_source_type", "description"],
+    "coordinate_points": [
+        "airfoil_id",
+        "version_id",
+        "point_order",
+        "x",
+        "y",
+        "surface",
+        "point_source",
+        "is_augmented",
+        "original_order",
+        "augmentation_method",
+    ],
+    "performance_records": [
+        "perf_id",
+        "airfoil_id",
+        "version_id",
+        "alpha_deg",
+        "reynolds_number",
+        "cl",
+        "cd",
+        "cm",
+        "source_type",
+        "is_anomaly",
+    ],
+    "anomaly_records": ["anomaly_id", "perf_id", "airfoil_id", "version_id", "rule_type", "detail"],
+}
+
+BATCH_IMPORT_INT_COLUMNS = {
+    "is_generated",
+    "has_augmented_coordinates",
+    "original_point_count",
+    "final_point_count",
+    "version_id",
+    "point_order",
+    "is_augmented",
+    "original_order",
+    "perf_id",
+    "reynolds_number",
+    "is_anomaly",
+    "anomaly_id",
+}
+
+BATCH_IMPORT_FLOAT_COLUMNS = {"x", "y", "alpha_deg", "cl", "cd", "cm"}
+MAX_BATCH_IMPORT_ROWS = 10000
+
+
+
+def ensure_core_trigger_schema() -> None:
+    global _CORE_TRIGGER_SCHEMA_READY
+    if _CORE_TRIGGER_SCHEMA_READY:
+        return
+    trigger_sql = [
+        "DROP TRIGGER IF EXISTS trg_lineage_airfoils_insert",
+        "DROP TRIGGER IF EXISTS trg_lineage_airfoils_update",
+        "DROP TRIGGER IF EXISTS trg_lineage_data_versions_insert",
+        "DROP TRIGGER IF EXISTS trg_lineage_data_versions_update",
+        "DROP TRIGGER IF EXISTS trg_lineage_coordinates_insert",
+        "DROP TRIGGER IF EXISTS trg_lineage_coordinates_update",
+        """
+        CREATE TRIGGER trg_lineage_airfoils_insert
+        AFTER INSERT ON airfoils
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+            VALUES
+                ('airfoils', NEW.airfoil_id, NEW.airfoil_id, 'master', 0, 0, 'INSERT')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = 'master',
+                last_operation = IF(is_modified = 1, last_operation, 'INSERT');
+        END
+        """,
+        """
+        CREATE TRIGGER trg_lineage_airfoils_update
+        AFTER UPDATE ON airfoils
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, previous_record_version_id,
+                 is_modified, last_modified_at, modified_count, last_operation)
+            VALUES
+                ('airfoils', NEW.airfoil_id, NEW.airfoil_id, 'master', 1, 0, 1, CURRENT_TIMESTAMP, 1, 'UPDATE')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = 'master',
+                previous_record_version_id = record_version_id,
+                record_version_id = record_version_id + 1,
+                is_modified = 1,
+                last_modified_at = CURRENT_TIMESTAMP,
+                modified_count = modified_count + 1,
+                last_operation = 'UPDATE';
+        END
+        """,
+        """
+        CREATE TRIGGER trg_lineage_data_versions_insert
+        AFTER INSERT ON data_versions
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+            VALUES
+                ('data_versions', CONCAT(NEW.airfoil_id, '#', NEW.version_id), NEW.airfoil_id, CONCAT('version ', NEW.version_id), 0, 0, 'INSERT')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = CONCAT('version ', NEW.version_id),
+                last_operation = IF(is_modified = 1, last_operation, 'INSERT');
+        END
+        """,
+        """
+        CREATE TRIGGER trg_lineage_data_versions_update
+        AFTER UPDATE ON data_versions
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, previous_record_version_id,
+                 is_modified, last_modified_at, modified_count, last_operation)
+            VALUES
+                ('data_versions', CONCAT(NEW.airfoil_id, '#', NEW.version_id), NEW.airfoil_id, CONCAT('version ', NEW.version_id),
+                 1, 0, 1, CURRENT_TIMESTAMP, 1, 'UPDATE')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = CONCAT('version ', NEW.version_id),
+                previous_record_version_id = record_version_id,
+                record_version_id = record_version_id + 1,
+                is_modified = 1,
+                last_modified_at = CURRENT_TIMESTAMP,
+                modified_count = modified_count + 1,
+                last_operation = 'UPDATE';
+        END
+        """,
+        """
+        CREATE TRIGGER trg_lineage_coordinates_insert
+        AFTER INSERT ON coordinate_points
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+            VALUES
+                ('coordinate_points', CONCAT(NEW.airfoil_id, '#', NEW.version_id, '#', NEW.point_order), NEW.airfoil_id,
+                 CONCAT('version ', NEW.version_id), 0, 0, 'INSERT')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = CONCAT('version ', NEW.version_id),
+                last_operation = IF(is_modified = 1, last_operation, 'INSERT');
+        END
+        """,
+        """
+        CREATE TRIGGER trg_lineage_coordinates_update
+        AFTER UPDATE ON coordinate_points
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, previous_record_version_id,
+                 is_modified, last_modified_at, modified_count, last_operation)
+            VALUES
+                ('coordinate_points', CONCAT(NEW.airfoil_id, '#', NEW.version_id, '#', NEW.point_order), NEW.airfoil_id,
+                 CONCAT('version ', NEW.version_id), 1, 0, 1, CURRENT_TIMESTAMP, 1, 'UPDATE')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = CONCAT('version ', NEW.version_id),
+                previous_record_version_id = record_version_id,
+                record_version_id = record_version_id + 1,
+                is_modified = 1,
+                last_modified_at = CURRENT_TIMESTAMP,
+                modified_count = modified_count + 1,
+                last_operation = 'UPDATE';
+        END
+        """,
+    ]
+    for sql in trigger_sql:
+        execute_write(sql)
+    _CORE_TRIGGER_SCHEMA_READY = True
+
+
+def ensure_stored_procedure_schema() -> None:
+    global _STORED_PROCEDURE_SCHEMA_READY
+    if _STORED_PROCEDURE_SCHEMA_READY:
+        return
+    try:
+        from import_mysql import STORED_PROCEDURES_SQL
+    except ModuleNotFoundError:
+        from backend.import_mysql import STORED_PROCEDURES_SQL
+
+    for name in [
+        "sp_airfoil_performance_summary",
+        "sp_compare_airfoils_by_re",
+        "sp_validate_performance_import_batch",
+        "sp_import_performance_batch",
+    ]:
+        execute_write(f"DROP PROCEDURE IF EXISTS {name}")
+    for sql in STORED_PROCEDURES_SQL:
+        execute_write(sql)
+    _STORED_PROCEDURE_SCHEMA_READY = True
+
+
+def ensure_anomaly_trigger_schema() -> None:
+    global _ANOMALY_TRIGGER_SCHEMA_READY
+    if _ANOMALY_TRIGGER_SCHEMA_READY:
+        return
+    trigger_sql = [
+        "DROP TRIGGER IF EXISTS trg_anomaly_requires_flag_insert",
+        "DROP TRIGGER IF EXISTS trg_anomaly_requires_flag_update",
+        "DROP TRIGGER IF EXISTS trg_lineage_anomalies_insert",
+        "DROP TRIGGER IF EXISTS trg_lineage_anomalies_update",
+        """
+        CREATE TRIGGER trg_anomaly_requires_flag_insert
+        BEFORE INSERT ON anomaly_records
+        FOR EACH ROW
+        BEGIN
+            IF (
+                SELECT is_anomaly
+                FROM performance_records
+                WHERE perf_id = NEW.perf_id
+                  AND airfoil_id = NEW.airfoil_id
+                  AND version_id = NEW.version_id
+            ) <> 1 THEN
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'anomaly_records can only reference performance_records with is_anomaly = 1';
+            END IF;
+        END
+        """,
+        """
+        CREATE TRIGGER trg_anomaly_requires_flag_update
+        BEFORE UPDATE ON anomaly_records
+        FOR EACH ROW
+        BEGIN
+            IF (
+                SELECT is_anomaly
+                FROM performance_records
+                WHERE perf_id = NEW.perf_id
+                  AND airfoil_id = NEW.airfoil_id
+                  AND version_id = NEW.version_id
+            ) <> 1 THEN
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'anomaly_records can only reference performance_records with is_anomaly = 1';
+            END IF;
+        END
+        """,
+        """
+        CREATE TRIGGER trg_lineage_anomalies_insert
+        AFTER INSERT ON anomaly_records
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+            VALUES
+                ('anomaly_records', CAST(NEW.anomaly_id AS CHAR), NEW.airfoil_id, CONCAT('version ', NEW.version_id), 0, 0, 'INSERT')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = CONCAT('version ', NEW.version_id),
+                last_operation = 'INSERT';
+        END
+        """,
+        """
+        CREATE TRIGGER trg_lineage_anomalies_update
+        AFTER UPDATE ON anomaly_records
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, previous_record_version_id, is_modified, last_modified_at, modified_count, last_operation)
+            VALUES
+                ('anomaly_records', CAST(NEW.anomaly_id AS CHAR), NEW.airfoil_id, CONCAT('version ', NEW.version_id), 1, 0, 1, CURRENT_TIMESTAMP, 1, 'UPDATE')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = CONCAT('version ', NEW.version_id),
+                previous_record_version_id = record_version_id,
+                record_version_id = record_version_id + 1,
+                is_modified = 1,
+                last_modified_at = CURRENT_TIMESTAMP,
+                modified_count = modified_count + 1,
+                last_operation = 'UPDATE';
+        END
+        """,
+    ]
+    for sql in trigger_sql:
+        execute_write(sql)
+    _ANOMALY_TRIGGER_SCHEMA_READY = True
+
+
+def ensure_performance_trigger_schema() -> None:
+    global _PERFORMANCE_TRIGGER_SCHEMA_READY
+    if _PERFORMANCE_TRIGGER_SCHEMA_READY:
+        return
+    trigger_sql = [
+        "DROP TRIGGER IF EXISTS trg_lineage_performance_insert",
+        "DROP TRIGGER IF EXISTS trg_lineage_performance_update",
+        "DROP TRIGGER IF EXISTS trg_audit_performance_update",
+        """
+        CREATE TRIGGER trg_lineage_performance_insert
+        AFTER INSERT ON performance_records
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, is_modified, last_operation)
+            VALUES
+                ('performance_records', CAST(NEW.perf_id AS CHAR), NEW.airfoil_id, CONCAT('version ', NEW.version_id), 0, 0, 'INSERT')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = CONCAT('version ', NEW.version_id),
+                last_operation = IF(is_modified = 1, last_operation, 'INSERT');
+        END
+        """,
+        """
+        CREATE TRIGGER trg_lineage_performance_update
+        AFTER UPDATE ON performance_records
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO data_record_lineage
+                (table_name, record_pk, airfoil_id, source_version, record_version_id, previous_record_version_id,
+                 is_modified, last_modified_at, modified_count, last_operation)
+            VALUES
+                ('performance_records', CAST(NEW.perf_id AS CHAR), NEW.airfoil_id, CONCAT('version ', NEW.version_id),
+                 1, 0, 1, CURRENT_TIMESTAMP, 1, 'UPDATE')
+            ON DUPLICATE KEY UPDATE
+                airfoil_id = NEW.airfoil_id,
+                source_version = CONCAT('version ', NEW.version_id),
+                previous_record_version_id = record_version_id,
+                record_version_id = record_version_id + 1,
+                is_modified = 1,
+                last_modified_at = CURRENT_TIMESTAMP,
+                modified_count = modified_count + 1,
+                last_operation = 'UPDATE';
+        END
+        """,
+        """
+        CREATE TRIGGER trg_audit_performance_update
+        AFTER UPDATE ON performance_records
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO audit_logs
+                (table_name, operation_type, record_pk, old_values, new_values)
+            VALUES
+                (
+                    'performance_records',
+                    'UPDATE',
+                    CAST(OLD.perf_id AS CHAR),
+                    JSON_OBJECT(
+                        'cl', OLD.cl,
+                        'cd', OLD.cd,
+                        'cm', OLD.cm,
+                        'is_anomaly', OLD.is_anomaly
+                    ),
+                    JSON_OBJECT(
+                        'cl', NEW.cl,
+                        'cd', NEW.cd,
+                        'cm', NEW.cm,
+                        'is_anomaly', NEW.is_anomaly
+                    )
+                );
+        END
+        """,
+    ]
+    for sql in trigger_sql:
+        execute_write(sql)
+    _PERFORMANCE_TRIGGER_SCHEMA_READY = True
+
+
+def ensure_soft_delete_schema() -> None:
+    global _SOFT_DELETE_SCHEMA_READY
+    if _SOFT_DELETE_SCHEMA_READY:
+        return
+    execute_write(
+        """
+        CREATE TABLE IF NOT EXISTS soft_delete_records (
+            delete_id INT AUTO_INCREMENT PRIMARY KEY,
+            table_name VARCHAR(64) NOT NULL,
+            record_pk VARCHAR(191) NOT NULL,
+            record_version_id INT NOT NULL DEFAULT 0,
+            airfoil_id VARCHAR(64) NULL,
+            version_id INT NULL,
+            row_snapshot JSON NOT NULL,
+            delete_reason TEXT NULL,
+            deleted_by_user_id INT NULL,
+            deleted_by_username VARCHAR(64) NULL,
+            deleted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            restored_by_user_id INT NULL,
+            restored_by_username VARCHAR(64) NULL,
+            restored_at TIMESTAMP NULL,
+            is_active TINYINT NOT NULL DEFAULT 1,
+            INDEX idx_soft_delete_record (table_name, record_pk, is_active),
+            INDEX idx_soft_delete_table (table_name),
+            INDEX idx_soft_delete_airfoil (airfoil_id),
+            INDEX idx_soft_delete_user (deleted_by_user_id),
+            CHECK (is_active IN (0, 1))
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    existing_columns = {
+        row["column_name"]
+        for row in query_all(
+            """
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'soft_delete_records'
+            """
+        )
+    }
+    if "record_version_id" not in existing_columns:
+        execute_write("ALTER TABLE soft_delete_records ADD COLUMN record_version_id INT NOT NULL DEFAULT 0 AFTER record_pk")
+    else:
+        execute_write("ALTER TABLE soft_delete_records MODIFY COLUMN record_version_id INT NOT NULL DEFAULT 0")
+    if "restored_by_user_id" not in existing_columns:
+        execute_write("ALTER TABLE soft_delete_records ADD COLUMN restored_by_user_id INT NULL AFTER deleted_at")
+    if "restored_by_username" not in existing_columns:
+        execute_write("ALTER TABLE soft_delete_records ADD COLUMN restored_by_username VARCHAR(64) NULL AFTER restored_by_user_id")
+    if "restored_at" not in existing_columns:
+        execute_write("ALTER TABLE soft_delete_records ADD COLUMN restored_at TIMESTAMP NULL AFTER restored_by_username")
+    existing_indexes = query_all(
+        """
+        SELECT INDEX_NAME AS index_name, NON_UNIQUE AS non_unique
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'soft_delete_records'
+        GROUP BY INDEX_NAME, NON_UNIQUE
+        """
+    )
+    if any(row["index_name"] == "uq_soft_delete_active_record" and int(row["non_unique"]) == 0 for row in existing_indexes):
+        execute_write("ALTER TABLE soft_delete_records DROP INDEX uq_soft_delete_active_record")
+    refreshed_indexes = query_all(
+        """
+        SELECT INDEX_NAME AS index_name
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'soft_delete_records'
+          AND INDEX_NAME = 'idx_soft_delete_record'
+        LIMIT 1
+        """
+    )
+    if not refreshed_indexes:
+        execute_write("ALTER TABLE soft_delete_records ADD INDEX idx_soft_delete_record (table_name, record_pk, is_active)")
+    _SOFT_DELETE_SCHEMA_READY = True
+
+
+def record_pk_sql(table_name: str, qualifier: str | None = None) -> str:
+    prefix = f"`{qualifier}`." if qualifier else ""
+    if table_name == "data_sources":
+        return f"{prefix}`source_type`"
+    if table_name == "airfoils":
+        return f"{prefix}`airfoil_id`"
+    if table_name == "data_versions":
+        return f"CONCAT({prefix}`airfoil_id`, '#', {prefix}`version_id`)"
+    if table_name == "coordinate_points":
+        return f"CONCAT({prefix}`airfoil_id`, '#', {prefix}`version_id`, '#', {prefix}`point_order`)"
+    if table_name == "performance_records":
+        return f"CAST({prefix}`perf_id` AS CHAR)"
+    if table_name == "anomaly_records":
+        return f"CAST({prefix}`anomaly_id` AS CHAR)"
+    raise ValueError(f"soft delete is not configured for {table_name}")
+
+
+def record_pk_from_row(table_name: str, row: dict[str, Any]) -> str:
+    if table_name == "data_sources":
+        return str(row["source_type"])
+    if table_name == "airfoils":
+        return str(row["airfoil_id"])
+    if table_name == "data_versions":
+        return f"{row['airfoil_id']}#{row['version_id']}"
+    if table_name == "coordinate_points":
+        return f"{row['airfoil_id']}#{row['version_id']}#{row['point_order']}"
+    if table_name == "performance_records":
+        return str(row["perf_id"])
+    if table_name == "anomaly_records":
+        return str(row["anomaly_id"])
+    raise ValueError(f"soft delete is not configured for {table_name}")
+
+
+def row_identity_where(table_name: str, row: dict[str, Any]) -> tuple[str, tuple[Any, ...]]:
+    if table_name == "data_sources":
+        return "`source_type` = %s", (row.get("source_type"),)
+    if table_name == "airfoils":
+        return "`airfoil_id` = %s", (row.get("airfoil_id"),)
+    if table_name == "data_versions":
+        return "`airfoil_id` = %s AND `version_id` = %s", (row.get("airfoil_id"), row.get("version_id"))
+    if table_name == "coordinate_points":
+        return "`airfoil_id` = %s AND `version_id` = %s AND `point_order` = %s", (row.get("airfoil_id"), row.get("version_id"), row.get("point_order"))
+    if table_name == "performance_records":
+        return "`perf_id` = %s", (row.get("perf_id"),)
+    if table_name == "anomaly_records":
+        return "`anomaly_id` = %s", (row.get("anomaly_id"),)
+    raise ValueError(f"soft delete is not configured for {table_name}")
+
+
+def soft_delete_filter_sql(table_name: str, qualifier: str | None = None) -> str:
+    if table_name not in SOFT_DELETE_TARGET_TABLES:
+        return "1 = 1"
+    outer_qualifier = qualifier or table_name
+    return (
+        "NOT EXISTS ("
+        "SELECT 1 FROM soft_delete_records sd "
+        f"WHERE sd.table_name = '{table_name}' "
+        f"AND sd.record_pk = {record_pk_sql(table_name, outer_qualifier)} "
+        "AND sd.is_active = 1)"
+    )
+
+
+@app.before_request
+def before_request() -> None:
+    ensure_auth_schema()
+    ensure_saved_transaction_schema()
+    ensure_lineage_schema()
+    ensure_import_schema()
+    ensure_soft_delete_schema()
+    ensure_core_trigger_schema()
+    ensure_performance_trigger_schema()
+    ensure_anomaly_trigger_schema()
+    ensure_stored_procedure_schema()
+
+
+def current_user() -> dict[str, Any] | None:
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    if session.get("username") and session.get("role"):
+        return {
+            "user_id": int(user_id),
+            "username": session["username"],
+            "role": session["role"],
+            "is_active": 1,
+            "created_at": session.get("created_at"),
+        }
+    rows = query_all(
+        """
+        SELECT user_id, username, role, is_active, created_at
+        FROM users
+        WHERE user_id = %s AND is_active = 1
+        """,
+        (user_id,),
+    )
+    if not rows:
+        session.clear()
+        return None
+    session["username"] = rows[0]["username"]
+    session["role"] = rows[0]["role"]
+    session["created_at"] = str(rows[0].get("created_at", ""))
+    return rows[0]
+
+
+def current_role() -> str | None:
+    user = current_user()
+    return user["role"] if user else None
+
+
+def is_manager(role: str | None) -> bool:
+    return role in {"engineer", "admin"}
+
+
+def is_analyst_or_manager(role: str | None) -> bool:
+    return role in {"analyst", "engineer", "admin"}
+
+
+def is_admin(role: str | None) -> bool:
+    return role == "admin"
+
+
+def valid_username(username: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_\u4e00-\u9fa5]{2,32}", username))
+
+
+def is_safe_select(sql: str) -> bool:
+    stripped = sql.strip()
+    if not stripped or ";" in stripped.rstrip(";"):
+        return False
+    normalized = stripped.rstrip(";").lstrip().lower()
+    return normalized.startswith("select") or normalized.startswith("explain select")
+
+
+def is_allowed_editor_sql(sql: str) -> bool:
+    stripped = sql.strip()
+    if not stripped or ";" in stripped.rstrip(";"):
+        return False
+    normalized = re.sub(r"\s+", " ", stripped.rstrip(";").lstrip().lower())
+    forbidden = (
+        "drop database",
+        "drop table",
+        "truncate",
+        "alter user",
+        "create user",
+        "grant ",
+        "revoke ",
+        "shutdown",
+        "load_file",
+        "into outfile",
+        "set password",
+    )
+    if any(token in normalized for token in forbidden):
+        return False
+    return normalized.startswith(
+        (
+            "select ",
+            "explain select ",
+            "insert ",
+            "update ",
+            "delete ",
+            "create index ",
+            "drop index ",
+            "call ",
+        )
+    )
+
+
+def split_sql_statements(sql_text: str) -> list[str]:
+    statements: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in sql_text:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote:
+            current.append(char)
+            escaped = True
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            current.append(char)
+            continue
+        if char == ";":
+            statement = "".join(current).strip()
+            if statement:
+                statements.append(statement)
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def is_allowed_transaction_sql(sql: str) -> bool:
+    normalized = re.sub(r"\s+", " ", sql.strip().lower())
+    forbidden = (
+        "create ",
+        "drop ",
+        "alter ",
+        "truncate",
+        "grant ",
+        "revoke ",
+        "start transaction",
+        "begin",
+        "commit",
+        "rollback",
+        "lock ",
+        "unlock ",
+        "load_file",
+        "into outfile",
+        " users",
+        " query_logs",
+    )
+    if any(token in f" {normalized}" for token in forbidden):
+        return False
+    return normalized.startswith(("select ", "insert ", "update ", "delete "))
+
+
+INDEX_ALLOWED_TABLES = {
+    "airfoils",
+    "data_versions",
+    "coordinate_points",
+    "performance_records",
+    "anomaly_records",
+    "data_sources",
+    "users",
+    "query_logs",
+}
+
+
+ADMIN_VIEW_TABLES = {
+    "data_sources",
+    "airfoils",
+    "data_versions",
+    "coordinate_points",
+    "performance_records",
+    "anomaly_records",
+    "audit_logs",
+    "data_record_lineage",
+    "data_import_records",
+    "soft_delete_records",
+    "performance_import_staging",
+    "saved_transactions",
+    "v_airfoil_overview",
+    "v_performance_with_ld",
+    "v_anomaly_details",
+}
+
+MAIN_TABLE_KEY_FILTERS = {
+    "data_sources": ["source_type"],
+    "airfoils": ["airfoil_id"],
+    "data_versions": ["airfoil_id", "version_id"],
+    "coordinate_points": ["airfoil_id", "version_id", "point_order"],
+    "performance_records": ["perf_id", "airfoil_id", "version_id"],
+    "anomaly_records": ["anomaly_id", "perf_id", "airfoil_id", "version_id"],
+    "audit_logs": ["audit_id", "table_name", "record_pk"],
+    "data_record_lineage": ["lineage_id", "table_name", "record_pk", "airfoil_id"],
+    "data_import_records": ["import_id", "target_table", "record_pk", "airfoil_id"],
+    "soft_delete_records": ["delete_id", "table_name", "record_pk", "airfoil_id"],
+    "performance_import_staging": ["staging_id", "batch_id", "perf_id"],
+    "saved_transactions": ["saved_id", "user_id"],
+    "v_airfoil_overview": ["airfoil_id"],
+    "v_performance_with_ld": ["perf_id", "airfoil_id", "version_id"],
+    "v_anomaly_details": ["anomaly_id", "perf_id", "airfoil_id", "version_id"],
+}
+
+
+def valid_identifier(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", value))
+
+
+def table_columns(table_name: str) -> list[str]:
+    if table_name not in INDEX_ALLOWED_TABLES:
+        return []
+    rows = query_all(
+        """
+        SELECT COLUMN_NAME AS column_name
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+        ORDER BY ordinal_position
+        """,
+        (table_name,),
+    )
+    return [row.get("column_name") or row.get("COLUMN_NAME") for row in rows]
+
+
+@app.get("/")
+def index() -> str:
+    return render_template_string(INDEX_HTML)
+
+
+@app.get("/api/summary")
+def summary() -> Any:
+    tables = [
+        "data_sources",
+        "airfoils",
+        "data_versions",
+        "coordinate_points",
+        "performance_records",
+        "anomaly_records",
+    ]
+    return jsonify(
+        {
+            table: query_all(
+                f"SELECT COUNT(*) AS count FROM {table} WHERE {soft_delete_filter_sql(table)}"
+            )[0]["count"]
+            for table in tables
+        }
+    )
+
+
+@app.get("/api/airfoils")
+def airfoils() -> Any:
+    rows = query_all(
+        f"""
+        SELECT
+            a.airfoil_id,
+            a.name,
+            a.family,
+            a.source_type,
+            a.original_point_count,
+            a.final_point_count,
+            a.has_augmented_coordinates,
+            COUNT(DISTINCT p.perf_id) AS performance_count,
+            COUNT(DISTINCT ar.anomaly_id) AS anomaly_count
+        FROM airfoils a
+        LEFT JOIN performance_records p ON p.airfoil_id = a.airfoil_id
+            AND {soft_delete_filter_sql("performance_records", "p")}
+        LEFT JOIN anomaly_records ar ON ar.perf_id = p.perf_id
+            AND {soft_delete_filter_sql("anomaly_records", "ar")}
+        WHERE {soft_delete_filter_sql("airfoils", "a")}
+        GROUP BY
+            a.airfoil_id, a.name, a.family, a.source_type,
+            a.original_point_count, a.final_point_count, a.has_augmented_coordinates
+        ORDER BY a.airfoil_id
+        """
+    )
+    return jsonify(rows)
+
+
+@app.get("/api/airfoils/<airfoil_id>")
+def airfoil_detail(airfoil_id: str) -> Any:
+    rows = query_all(
+        f"""
+        SELECT airfoil_id, name, source, family, is_generated, source_type, source_file,
+               has_augmented_coordinates, original_point_count, final_point_count
+        FROM airfoils
+        WHERE airfoil_id = %s AND {soft_delete_filter_sql("airfoils")}
+        """,
+        (airfoil_id,),
+    )
+    if not rows:
+        return jsonify({"error": "airfoil not found"}), 404
+    versions = query_all(
+        f"""
+        SELECT airfoil_id, version_id, version_type, coordinate_source_type, description
+        FROM data_versions
+        WHERE airfoil_id = %s AND {soft_delete_filter_sql("data_versions")}
+        ORDER BY version_id
+        """,
+        (airfoil_id,),
+    )
+    return jsonify({"airfoil": rows[0], "versions": versions})
+
+
+@app.get("/api/coordinates")
+def coordinates() -> Any:
+    rows = query_all(
+        f"""
+        SELECT point_order, x, y, surface, point_source, is_augmented
+        FROM coordinate_points
+        WHERE airfoil_id = %s AND version_id = %s AND {soft_delete_filter_sql("coordinate_points")}
+        ORDER BY point_order
+        """,
+        (request.args.get("airfoil_id", ""), int(request.args.get("version_id", "1"))),
+    )
+    return jsonify(rows)
+
+
+@app.get("/api/performance")
+def performance() -> Any:
+    airfoil_id = request.args.get("airfoil_id", "")
+    version_id = int(request.args.get("version_id", "1"))
+    reynolds_number = request.args.get("reynolds_number")
+    params: list[Any] = [airfoil_id, version_id]
+    where = "airfoil_id = %s AND version_id = %s"
+    if reynolds_number:
+        where += " AND reynolds_number = %s"
+        params.append(int(reynolds_number))
+
+    rows = query_all(
+        f"""
+        SELECT perf_id, alpha_deg, reynolds_number, cl, cd, cm, is_anomaly
+        FROM performance_records
+        WHERE {where} AND {soft_delete_filter_sql("performance_records")}
+        ORDER BY reynolds_number, alpha_deg
+        """,
+        tuple(params),
+    )
+    return jsonify(rows)
+
+
+@app.get("/api/performance_compare")
+def performance_compare() -> Any:
+    reynolds_number = int(request.args.get("reynolds_number", "50000"))
+    metric = request.args.get("metric", "max_cl")
+    metric_sql = {
+        "max_cl": "MAX(p.cl)",
+        "min_cd": "MIN(p.cd)",
+        "max_ld": "MAX(p.cl / NULLIF(p.cd, 0))",
+        "avg_cl": "AVG(p.cl)",
+    }.get(metric, "MAX(p.cl)")
+    rows = query_all(
+        f"""
+        SELECT p.airfoil_id, a.name, ROUND({metric_sql}, 6) AS value
+        FROM performance_records p
+        JOIN airfoils a ON a.airfoil_id = p.airfoil_id
+        WHERE p.reynolds_number = %s
+          AND {soft_delete_filter_sql("airfoils", "a")}
+          AND {soft_delete_filter_sql("performance_records", "p")}
+        GROUP BY p.airfoil_id, a.name
+        HAVING value IS NOT NULL
+        ORDER BY value DESC
+        LIMIT 24
+        """,
+        (reynolds_number,),
+    )
+    return jsonify(rows)
+
+
+@app.get("/api/version_compare")
+def version_compare() -> Any:
+    reynolds_number = int(request.args.get("reynolds_number", "50000"))
+    rows = query_all(
+        f"""
+        SELECT
+            dv.airfoil_id,
+            a.name,
+            dv.version_id,
+            dv.version_type,
+            ROUND(MAX(p.cl / NULLIF(p.cd, 0)), 6) AS value
+        FROM data_versions dv
+        JOIN airfoils a ON a.airfoil_id = dv.airfoil_id
+        JOIN performance_records p
+          ON p.airfoil_id = dv.airfoil_id
+         AND p.version_id = dv.version_id
+        WHERE p.reynolds_number = %s
+        GROUP BY dv.airfoil_id, a.name, dv.version_id, dv.version_type
+        HAVING value IS NOT NULL
+        ORDER BY value DESC, dv.airfoil_id, dv.version_id
+        LIMIT 18
+        """,
+        (reynolds_number,),
+    )
+    return jsonify(rows)
+
+
+@app.get("/api/anomalies")
+def anomalies() -> Any:
+    rows = query_all(
+        f"""
+        SELECT ar.anomaly_id, ar.perf_id, ar.rule_type, ar.detail,
+               p.alpha_deg, p.reynolds_number, p.cl, p.cd, p.cm
+        FROM anomaly_records ar
+        JOIN performance_records p ON p.perf_id = ar.perf_id
+        WHERE ar.airfoil_id = %s AND ar.version_id = %s
+          AND {soft_delete_filter_sql("anomaly_records", "ar")}
+          AND {soft_delete_filter_sql("performance_records", "p")}
+        ORDER BY ar.anomaly_id
+        """,
+        (request.args.get("airfoil_id", ""), int(request.args.get("version_id", "1"))),
+    )
+    return jsonify(rows)
+
+
+@app.get("/api/auth/me")
+def auth_me() -> Any:
+    user = current_user()
+    return jsonify({"authenticated": bool(user), "user": user})
+
+
+@app.post("/api/auth/register")
+def auth_register() -> Any:
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+
+    if not valid_username(username):
+        return jsonify({"error": "username must be 2-32 letters, numbers, underscores, or Chinese characters"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "password must be at least 6 characters"}), 400
+
+    role = "viewer"
+    try:
+        user_id = execute_write_return_id(
+            "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+            (username, make_password_hash(password), role),
+        )
+    except pymysql.err.IntegrityError:
+        return jsonify({"error": "username already exists"}), 409
+
+    log_user_action(
+        user_id,
+        f"Registered read-only user {username}",
+        f"INSERT INTO users (username, role) VALUES ('{username}', 'viewer')",
+        1,
+    )
+    session["user_id"] = user_id
+    session["username"] = username
+    session["role"] = role
+    return jsonify({"user_id": user_id, "username": username, "role": role})
+
+
+@app.post("/api/auth/login")
+def auth_login() -> Any:
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    rows = query_all(
+        """
+        SELECT user_id, username, password_hash, role, is_active
+        FROM users
+        WHERE username = %s
+        """,
+        (username,),
+    )
+    if not rows or rows[0]["is_active"] != 1:
+        return jsonify({"error": "username or password is wrong"}), 401
+    user = rows[0]
+    if not user.get("password_hash") or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "username or password is wrong"}), 401
+
+    session["user_id"] = user["user_id"]
+    session["username"] = user["username"]
+    session["role"] = user["role"]
+    if not str(user["password_hash"]).startswith(PASSWORD_HASH_METHOD + "$"):
+        execute_write(
+            "UPDATE users SET password_hash = %s WHERE user_id = %s",
+            (make_password_hash(password), user["user_id"]),
+        )
+    log_user_action(user["user_id"], f"User {username} logged in", "LOGIN", 1)
+    return jsonify({"user_id": user["user_id"], "username": user["username"], "role": user["role"]})
+
+
+@app.post("/api/auth/logout")
+def auth_logout() -> Any:
+    user = current_user()
+    if user:
+        log_user_action(user["user_id"], f"User {user['username']} logged out", "LOGOUT", 1)
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/admin/users")
+def admin_users() -> Any:
+    role = current_role()
+    if not is_manager(role):
+        return jsonify({"error": "manager permission required"}), 403
+    rows = query_all(
+        """
+        SELECT user_id, username, role, is_active, created_at
+        FROM users
+        ORDER BY user_id
+        """
+    )
+    return jsonify(rows)
+
+
+@app.post("/api/admin/users/create")
+def admin_create_user() -> Any:
+    user = current_user()
+    if not user or not is_admin(user["role"]):
+        return jsonify({"error": "admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    role = str(payload.get("role", "viewer")).strip()
+    if role not in {"viewer", "analyst", "engineer", "admin"}:
+        return jsonify({"error": "invalid role"}), 400
+    if not valid_username(username):
+        return jsonify({"error": "invalid username"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "password must be at least 6 characters"}), 400
+
+    try:
+        new_user_id = execute_write_return_id(
+            "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+            (username, make_password_hash(password), role),
+        )
+    except pymysql.err.IntegrityError:
+        log_user_action(
+            user["user_id"],
+            f"Rejected admin user creation: duplicate {username}",
+            f"INSERT INTO users (username, role) VALUES ('{username}', '{role}')",
+            0,
+        )
+        return jsonify({"error": "username already exists"}), 409
+
+    log_user_action(
+        user["user_id"],
+        f"Admin created user {username}",
+        f"INSERT INTO users (username, role) VALUES ('{username}', '{role}')",
+        1,
+    )
+    return jsonify({"user_id": new_user_id, "username": username, "role": role})
+
+
+@app.get("/api/admin/query_logs")
+def admin_query_logs() -> Any:
+    role = current_role()
+    if not is_manager(role):
+        return jsonify({"error": "manager permission required"}), 403
+    rows = query_all(
+        """
+        SELECT q.log_id, q.user_id, u.username, q.natural_language, q.sql_text,
+               q.is_valid, q.execution_time_ms, q.executed_at
+        FROM query_logs q
+        JOIN users u ON u.user_id = q.user_id
+        ORDER BY q.log_id DESC
+        LIMIT 50
+        """
+    )
+    return jsonify(rows)
+
+
+@app.get("/api/admin/main_table")
+def admin_main_table() -> Any:
+    role = current_role()
+    if not is_analyst_or_manager(role):
+        return jsonify({"error": "analyst/engineer/admin permission required"}), 403
+    table_name = request.args.get("table", "airfoils")
+    limit_arg = request.args.get("limit", "100")
+    if table_name not in ADMIN_VIEW_TABLES:
+        return jsonify({"error": "table is not allowed"}), 400
+    if role != "admin" and table_name in {"users", "query_logs", "audit_logs", "data_record_lineage", "data_import_records", "soft_delete_records", "saved_transactions", "performance_import_staging"}:
+        return jsonify({"error": "non-admin users can view engineering data and views only"}), 403
+    if table_name == "data_record_lineage":
+        ensure_lineage_schema()
+        sync_lineage_records()
+    elif table_name == "data_import_records":
+        ensure_import_schema()
+        sync_import_records()
+    elif table_name == "soft_delete_records":
+        ensure_soft_delete_schema()
+
+    columns = [
+        row["column_name"]
+        for row in query_all(
+            """
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (table_name,),
+        )
+    ]
+    if not columns:
+        return jsonify({"error": "table has no visible columns"}), 400
+
+    include_options = request.args.get("include_options", "0") == "1"
+    filter_columns = [column for column in MAIN_TABLE_KEY_FILTERS.get(table_name, []) if column in columns]
+    filter_options: dict[str, list[Any]] = {}
+    if include_options:
+        option_soft_filter = f" AND {soft_delete_filter_sql(table_name)}" if table_name in SOFT_DELETE_TARGET_TABLES else ""
+        for column in filter_columns:
+            filter_options[column] = [
+                row["value"]
+                for row in query_all(
+                    f"""
+                    SELECT value
+                    FROM (
+                        SELECT DISTINCT `{column}` AS value
+                        FROM `{table_name}`
+                        WHERE `{column}` IS NOT NULL
+                        {option_soft_filter}
+                    ) AS distinct_values
+                    ORDER BY CAST(value AS CHAR)
+                    LIMIT 300
+                    """
+                )
+            ]
+
+    where_parts: list[str] = []
+    params: list[Any] = []
+    filters: dict[str, str] = {}
+    for column in filter_columns:
+        value = request.args.get(f"filter_{column}", "").strip()
+        if value:
+            filters[column] = value
+            where_parts.append(f"CAST(`{column}` AS CHAR) = %s")
+            params.append(value)
+    if table_name in SOFT_DELETE_TARGET_TABLES:
+        where_parts.append(soft_delete_filter_sql(table_name))
+    where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+
+    total = query_all(f"SELECT COUNT(*) AS count FROM `{table_name}`{where_sql}", tuple(params))[0]["count"]
+    if limit_arg == "all":
+        rows = query_all(f"SELECT * FROM `{table_name}`{where_sql}", tuple(params))
+        limit: int | str = "all"
+    else:
+        limit = min(max(int(limit_arg), 1), 10000)
+        rows = query_all(f"SELECT * FROM `{table_name}`{where_sql} LIMIT %s", tuple(params + [limit]))
+    return jsonify(
+        {
+            "table": table_name,
+            "total": total,
+            "limit": limit,
+            "columns": columns,
+            "filter_columns": filter_columns,
+            "filter_options": filter_options,
+            "filters": filters,
+            "rows": rows,
+        }
+    )
+
+
+def required_int(payload: dict[str, Any], key: str) -> int:
+    value = payload.get(key)
+    if value in (None, ""):
+        raise ValueError(f"{key} is required")
+    return int(value)
+
+
+def required_float(payload: dict[str, Any], key: str) -> float:
+    value = payload.get(key)
+    if value in (None, ""):
+        raise ValueError(f"{key} is required")
+    return float(value)
+
+
+def friendly_mysql_error(exc: pymysql.MySQLError, table_name: str = "") -> str:
+    code = exc.args[0] if exc.args else None
+    message = str(exc)
+    if code == 1062:
+        return f"{table_name or '记录'} 创建失败：主键或唯一字段重复，数据库中已经存在相同记录。"
+    if code == 1452:
+        if table_name == "coordinate_points":
+            return "coordinate_points 创建失败：引用的 airfoil_id + version_id 在 data_versions 中不存在，请先为该翼型创建对应数据版本。"
+        if table_name == "data_versions":
+            return "data_versions 创建失败：引用的 airfoil_id 在 airfoils 中不存在，请先创建翼型基本信息。"
+        return f"{table_name or '记录'} 创建失败：外键引用不存在，请先创建被引用的主表记录。"
+    if code == 3819:
+        if table_name == "coordinate_points":
+            if "coordinate_points_chk_2" in message:
+                return "coordinate_points 创建失败：x 坐标必须在 -0.001 到 1.001 之间。"
+            if "coordinate_points_chk_3" in message:
+                return "coordinate_points 创建失败：surface 只能是 upper 或 lower。"
+            if "coordinate_points_chk_4" in message:
+                return "coordinate_points 创建失败：point_source 只能是 real 或 augmented。"
+            if "coordinate_points_chk_5" in message:
+                return "coordinate_points 创建失败：is_augmented 只能是 0 或 1。"
+            if "coordinate_points_chk_6" in message:
+                return "coordinate_points 创建失败：augmentation_method 只能是 original_coordinate 或 linear_interpolation。"
+            if "coordinate_points_chk_7" in message:
+                return "coordinate_points 创建失败：真实点必须为 real + is_augmented=0 + original_coordinate；增强点必须为 augmented + is_augmented=1 + linear_interpolation。"
+        return f"{table_name or '记录'} 创建失败：违反了表的 CHECK 约束，请检查字段取值范围和枚举值。"
+    return message
+
+
+@app.errorhandler(pymysql.MySQLError)
+def handle_mysql_error(exc: pymysql.MySQLError) -> Any:
+    return jsonify({"error": friendly_mysql_error(exc), "mysql_error": str(exc)}), 500
+
+
+@app.post("/api/performance_records/update")
+def update_performance_record() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        perf_id = required_int(payload, "perf_id")
+        cl = required_float(payload, "cl")
+        cd = required_float(payload, "cd")
+        cm = required_float(payload, "cm")
+        is_anomaly = int(payload.get("is_anomaly", 0))
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    if is_anomaly not in {0, 1}:
+        return jsonify({"error": "is_anomaly must be 0 or 1"}), 400
+
+    start = time.perf_counter()
+    try:
+        affected = execute_write(
+            """
+            UPDATE performance_records
+            SET cl = %s, cd = %s, cm = %s, is_anomaly = %s
+            WHERE perf_id = %s
+            """,
+            (cl, cd, cm, is_anomaly, perf_id),
+        )
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed performance update {perf_id}", "UPDATE performance_records", 0, elapsed_ms)
+        return jsonify({"error": str(exc)}), 400
+
+    rows = query_all(
+        """
+        SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, is_anomaly
+        FROM performance_records
+        WHERE perf_id = %s
+        """,
+        (perf_id,),
+    )
+    if rows:
+        mark_lineage_modified(
+            "performance_records",
+            str(perf_id),
+            rows[0]["airfoil_id"],
+            f"version {rows[0]['version_id']}",
+            user,
+        )
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Updated performance record {perf_id}", "UPDATE performance_records", 1 if affected else 0, elapsed_ms)
+    return jsonify({"affected_rows": affected, "elapsed_ms": elapsed_ms, "rows": rows})
+
+
+@app.post("/api/airfoils/update")
+def update_airfoil_record() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    airfoil_id = str(payload.get("airfoil_id", "")).strip()
+    name = str(payload.get("name", "")).strip()
+    source = str(payload.get("source", "")).strip()
+    family = str(payload.get("family", "")).strip()
+    source_type = str(payload.get("source_type", "")).strip()
+    source_file = str(payload.get("source_file", "")).strip()
+    try:
+        is_generated = int(payload.get("is_generated", 0))
+        has_augmented_coordinates = int(payload.get("has_augmented_coordinates", 0))
+        original_point_count = int(payload.get("original_point_count", 1))
+        final_point_count = int(payload.get("final_point_count", 1))
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not airfoil_id or not name or not source or not family or not source_type or not source_file:
+        return jsonify({"error": "airfoil_id, name, source, family, source_type, and source_file are required"}), 400
+    if is_generated not in {0, 1} or has_augmented_coordinates not in {0, 1}:
+        return jsonify({"error": "is_generated and has_augmented_coordinates must be 0 or 1"}), 400
+    if original_point_count <= 0 or final_point_count < original_point_count:
+        return jsonify({"error": "point counts must be positive and final_point_count >= original_point_count"}), 400
+
+    start = time.perf_counter()
+    try:
+        affected = execute_write(
+            """
+            UPDATE airfoils
+            SET name = %s,
+                source = %s,
+                family = %s,
+                is_generated = %s,
+                source_type = %s,
+                source_file = %s,
+                has_augmented_coordinates = %s,
+                original_point_count = %s,
+                final_point_count = %s
+            WHERE airfoil_id = %s
+            """,
+            (
+                name,
+                source,
+                family,
+                is_generated,
+                source_type,
+                source_file,
+                has_augmented_coordinates,
+                original_point_count,
+                final_point_count,
+                airfoil_id,
+            ),
+        )
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed airfoil update {airfoil_id}", "UPDATE airfoils", 0, elapsed_ms)
+        return jsonify({"error": str(exc)}), 400
+
+    rows = query_all("SELECT * FROM airfoils WHERE airfoil_id = %s", (airfoil_id,))
+    mark_lineage_modified("airfoils", airfoil_id, airfoil_id, "master", user)
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Updated airfoil {airfoil_id}", "UPDATE airfoils", 1 if affected else 0, elapsed_ms)
+    return jsonify({"affected_rows": affected, "elapsed_ms": elapsed_ms, "rows": rows})
+
+
+@app.post("/api/anomaly_records/update")
+def update_anomaly_record() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        anomaly_id = required_int(payload, "anomaly_id")
+        perf_id = required_int(payload, "perf_id")
+        version_id = required_int(payload, "version_id")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    airfoil_id = str(payload.get("airfoil_id", "")).strip()
+    rule_type = str(payload.get("rule_type", "")).strip()
+    detail = str(payload.get("detail", "")).strip()
+    if not airfoil_id or not detail:
+        return jsonify({"error": "airfoil_id and detail are required"}), 400
+    if rule_type not in {"negative_cd", "extreme_cl", "extreme_ld_ratio"}:
+        return jsonify({"error": "rule_type must be negative_cd, extreme_cl, or extreme_ld_ratio"}), 400
+
+    start = time.perf_counter()
+    try:
+        affected = execute_write(
+            """
+            UPDATE anomaly_records
+            SET perf_id = %s,
+                airfoil_id = %s,
+                version_id = %s,
+                rule_type = %s,
+                detail = %s
+            WHERE anomaly_id = %s
+            """,
+            (perf_id, airfoil_id, version_id, rule_type, detail, anomaly_id),
+        )
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed anomaly update {anomaly_id}", "UPDATE anomaly_records", 0, elapsed_ms)
+        return jsonify({"error": str(exc)}), 400
+
+    rows = query_all("SELECT * FROM anomaly_records WHERE anomaly_id = %s", (anomaly_id,))
+    if rows:
+        mark_lineage_modified(
+            "anomaly_records",
+            str(anomaly_id),
+            rows[0]["airfoil_id"],
+            f"version {rows[0]['version_id']}",
+            user,
+        )
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Updated anomaly record {anomaly_id}", "UPDATE anomaly_records", 1 if affected else 0, elapsed_ms)
+    return jsonify({"affected_rows": affected, "elapsed_ms": elapsed_ms, "rows": rows})
+
+
+@app.post("/api/coordinate_points/update")
+def update_coordinate_point() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        airfoil_id = str(payload.get("airfoil_id", "")).strip()
+        version_id = required_int(payload, "version_id")
+        point_order = required_int(payload, "point_order")
+        x_value = required_float(payload, "x")
+        y_value = required_float(payload, "y")
+        is_augmented = int(payload.get("is_augmented", 0))
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    surface = str(payload.get("surface", "")).strip()
+    point_source = str(payload.get("point_source", "")).strip()
+    augmentation_method = str(payload.get("augmentation_method", "")).strip()
+    original_order_raw = str(payload.get("original_order", "")).strip()
+    try:
+        original_order = None if original_order_raw == "" else int(original_order_raw)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    if not airfoil_id:
+        return jsonify({"error": "airfoil_id is required"}), 400
+    if surface not in {"upper", "lower"}:
+        return jsonify({"error": "surface must be upper or lower"}), 400
+    if point_source not in {"real", "augmented"}:
+        return jsonify({"error": "point_source must be real or augmented"}), 400
+    if is_augmented not in {0, 1}:
+        return jsonify({"error": "is_augmented must be 0 or 1"}), 400
+    if augmentation_method not in {"original_coordinate", "linear_interpolation"}:
+        return jsonify({"error": "augmentation_method must be original_coordinate or linear_interpolation"}), 400
+    if point_source == "real" and (is_augmented != 0 or augmentation_method != "original_coordinate"):
+        return jsonify({"error": "real points must use is_augmented=0 and original_coordinate"}), 400
+    if point_source == "augmented" and (is_augmented != 1 or augmentation_method != "linear_interpolation"):
+        return jsonify({"error": "augmented points must use is_augmented=1 and linear_interpolation"}), 400
+
+    start = time.perf_counter()
+    try:
+        affected = execute_write(
+            """
+            UPDATE coordinate_points
+            SET x = %s,
+                y = %s,
+                surface = %s,
+                point_source = %s,
+                is_augmented = %s,
+                original_order = %s,
+                augmentation_method = %s
+            WHERE airfoil_id = %s AND version_id = %s AND point_order = %s
+            """,
+            (
+                x_value,
+                y_value,
+                surface,
+                point_source,
+                is_augmented,
+                original_order,
+                augmentation_method,
+                airfoil_id,
+                version_id,
+                point_order,
+            ),
+        )
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed coordinate point update {airfoil_id}#{version_id}#{point_order}", "UPDATE coordinate_points", 0, elapsed_ms)
+        return jsonify({"error": str(exc)}), 400
+
+    rows = query_all(
+        """
+        SELECT *
+        FROM coordinate_points
+        WHERE airfoil_id = %s AND version_id = %s AND point_order = %s
+        """,
+        (airfoil_id, version_id, point_order),
+    )
+    if rows:
+        mark_lineage_modified(
+            "coordinate_points",
+            f"{airfoil_id}#{version_id}#{point_order}",
+            airfoil_id,
+            f"version {version_id}",
+            user,
+        )
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Updated coordinate point {airfoil_id}#{version_id}#{point_order}", "UPDATE coordinate_points", 1 if affected else 0, elapsed_ms)
+    return jsonify({"affected_rows": affected, "elapsed_ms": elapsed_ms, "rows": rows})
+
+
+@app.post("/api/data_sources/update")
+def update_data_source() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    source_type = str(payload.get("source_type", "")).strip()
+    description = str(payload.get("description", "")).strip()
+    if source_type not in {"uiuc_raw", "uiuc_raw_with_tracked_augmentation", "generated_synthetic", "injected_anomaly"}:
+        return jsonify({"error": "invalid source_type"}), 400
+    if not description:
+        return jsonify({"error": "description is required"}), 400
+
+    start = time.perf_counter()
+    try:
+        affected = execute_write(
+            "UPDATE data_sources SET description = %s WHERE source_type = %s",
+            (description, source_type),
+        )
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed data source update {source_type}", "UPDATE data_sources", 0, elapsed_ms)
+        return jsonify({"error": str(exc)}), 400
+
+    rows = query_all("SELECT * FROM data_sources WHERE source_type = %s", (source_type,))
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Updated data source {source_type}", "UPDATE data_sources", 1 if affected else 0, elapsed_ms)
+    return jsonify({"affected_rows": affected, "elapsed_ms": elapsed_ms, "rows": rows})
+
+
+@app.post("/api/data_versions/update")
+def update_data_version() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    airfoil_id = str(payload.get("airfoil_id", "")).strip()
+    try:
+        version_id = required_int(payload, "version_id")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    version_type = str(payload.get("version_type", "")).strip()
+    coordinate_source_type = str(payload.get("coordinate_source_type", "")).strip()
+    description = str(payload.get("description", "")).strip()
+    if not airfoil_id:
+        return jsonify({"error": "airfoil_id is required"}), 400
+    if version_type not in {"imported_raw", "augmented_from_raw"}:
+        return jsonify({"error": "invalid version_type"}), 400
+    if coordinate_source_type not in {"real_only", "mixed_real_and_augmented"}:
+        return jsonify({"error": "invalid coordinate_source_type"}), 400
+
+    start = time.perf_counter()
+    try:
+        affected = execute_write(
+            """
+            UPDATE data_versions
+            SET version_type = %s,
+                coordinate_source_type = %s,
+                description = %s
+            WHERE airfoil_id = %s AND version_id = %s
+            """,
+            (version_type, coordinate_source_type, description, airfoil_id, version_id),
+        )
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed data version update {airfoil_id}#{version_id}", "UPDATE data_versions", 0, elapsed_ms)
+        return jsonify({"error": str(exc)}), 400
+
+    rows = query_all("SELECT * FROM data_versions WHERE airfoil_id = %s AND version_id = %s", (airfoil_id, version_id))
+    if rows:
+        mark_lineage_modified("data_versions", f"{airfoil_id}#{version_id}", airfoil_id, f"version {version_id}", user)
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Updated data version {airfoil_id}#{version_id}", "UPDATE data_versions", 1 if affected else 0, elapsed_ms)
+    return jsonify({"affected_rows": affected, "elapsed_ms": elapsed_ms, "rows": rows})
+
+
+def batch_import_value(table_name: str, column: str, value: Any) -> Any:
+    if value == "":
+        if table_name == "coordinate_points" and column == "original_order":
+            return None
+        if table_name in {"data_versions", "anomaly_records"} and column in {"description", "detail"}:
+            return None
+    if column in BATCH_IMPORT_INT_COLUMNS:
+        if value in (None, ""):
+            raise ValueError(f"{column} is required")
+        return int(value)
+    if column in BATCH_IMPORT_FLOAT_COLUMNS:
+        if value in (None, ""):
+            raise ValueError(f"{column} is required")
+        return float(value)
+    return "" if value is None else str(value).strip()
+
+
+def batch_record_identity(table_name: str, row: dict[str, Any]) -> tuple[str, str | None, int | None, str | None, str]:
+    if table_name == "data_sources":
+        pk = str(row["source_type"])
+        return pk, None, None, pk, "source"
+    if table_name == "airfoils":
+        pk = str(row["airfoil_id"])
+        return pk, pk, None, str(row.get("source_type") or ""), "master"
+    if table_name == "data_versions":
+        airfoil_id = str(row["airfoil_id"])
+        version_id = int(row["version_id"])
+        return f"{airfoil_id}#{version_id}", airfoil_id, version_id, None, f"version {version_id}"
+    if table_name == "coordinate_points":
+        airfoil_id = str(row["airfoil_id"])
+        version_id = int(row["version_id"])
+        return f"{airfoil_id}#{version_id}#{int(row['point_order'])}", airfoil_id, version_id, None, f"version {version_id}"
+    if table_name == "performance_records":
+        version_id = int(row["version_id"])
+        return str(row["perf_id"]), str(row["airfoil_id"]), version_id, str(row.get("source_type") or ""), f"version {version_id}"
+    if table_name == "anomaly_records":
+        version_id = int(row["version_id"])
+        return str(row["anomaly_id"]), str(row["airfoil_id"]), version_id, None, f"version {version_id}"
+    raise ValueError("unsupported table")
+
+
+def validate_batch_payload(payload: dict[str, Any]) -> tuple[str, str, list[str], list[dict[str, Any]]]:
+    table_name = str(payload.get("table", "")).strip()
+    batch_id = str(payload.get("batch_id", "")).strip()
+    headers = payload.get("headers", [])
+    rows = payload.get("rows", [])
+    if table_name not in BATCH_IMPORT_COLUMNS:
+        raise ValueError("target table is not supported for batch import")
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", batch_id):
+        raise ValueError("batch_id must be 1-64 letters, numbers, underscores, or dashes")
+    expected = BATCH_IMPORT_COLUMNS[table_name]
+    if headers != expected:
+        raise ValueError(
+            "CSV/TSV header does not match the selected table order. "
+            f"Expected: {', '.join(expected)}; got: {', '.join(str(x) for x in headers)}"
+        )
+    if not isinstance(rows, list) or not rows or len(rows) > MAX_BATCH_IMPORT_ROWS:
+        raise ValueError("rows must contain 1-10000 records")
+    return table_name, batch_id, expected, rows
+
+
+def import_generic_batch(table_name: str, batch_id: str, columns: list[str], rows: list[dict[str, Any]], user: dict[str, Any]) -> dict[str, Any]:
+    parsed_rows: list[dict[str, Any]] = []
+    values: list[tuple[Any, ...]] = []
+    for row_no, row in enumerate(rows, start=2):
+        if not isinstance(row, dict):
+            raise ValueError(f"line {row_no}: row must be an object")
+        if set(row.keys()) != set(columns):
+            raise ValueError(f"line {row_no}: columns do not match selected table")
+        parsed = {column: batch_import_value(table_name, column, row.get(column, "")) for column in columns}
+        parsed_rows.append(parsed)
+        values.append(tuple(parsed[column] for column in columns))
+
+    start = time.perf_counter()
+    column_sql = ", ".join(f"`{column}`" for column in columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(f"INSERT INTO `{table_name}` ({column_sql}) VALUES ({placeholders})", values)
+        conn.commit()
+    except pymysql.MySQLError as exc:
+        conn.rollback()
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed batch import {batch_id} into {table_name}", f"INSERT INTO {table_name}", 0, elapsed_ms)
+        raise ValueError(friendly_mysql_error(exc, table_name)) from exc
+    finally:
+        release_db_connection(conn)
+
+    inserted_rows: list[dict[str, Any]] = []
+    for parsed in parsed_rows:
+        record_pk, airfoil_id, version_id, source_type, source_version = batch_record_identity(table_name, parsed)
+        log_data_import(
+            table_name,
+            record_pk,
+            "frontend",
+            user,
+            airfoil_id=airfoil_id,
+            version_id=version_id,
+            source_type=source_type,
+            description=f"batch_id={batch_id}; header_aligned_import",
+        )
+        mark_lineage_insert(table_name, record_pk, airfoil_id, source_version)
+        inserted_rows.append({"table_name": table_name, "record_pk": record_pk, **parsed})
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Batch import {batch_id} into {table_name}", f"INSERT INTO {table_name}", 1, elapsed_ms)
+    return {
+        "batch_id": batch_id,
+        "target_table": table_name,
+        "elapsed_ms": elapsed_ms,
+        "sections": [
+            {"title": "Header validation", "rows": [{"target_table": table_name, "expected_header": ", ".join(columns), "status": "matched"}]},
+            {"title": "Imported rows", "rows": inserted_rows},
+        ],
+    }
+
+
+def import_performance_batch(user: dict[str, Any], payload: dict[str, Any]) -> Any:
+    batch_id = str(payload.get("batch_id", "")).strip()
+    rows = payload.get("rows", [])
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", batch_id):
+        return jsonify({"error": "batch_id must be 1-64 letters, numbers, underscores, or dashes"}), 400
+    if not isinstance(rows, list) or not rows or len(rows) > MAX_BATCH_IMPORT_ROWS:
+        return jsonify({"error": "rows must contain 1-10000 records"}), 400
+
+    parsed_rows: list[tuple[Any, ...]] = []
+    perf_ids: list[int] = []
+    try:
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("each row must be an object")
+            if set(row.keys()) != set(BATCH_IMPORT_COLUMNS["performance_records"]):
+                raise ValueError("performance_records columns do not match the required header")
+            perf_id = required_int(row, "perf_id")
+            parsed_rows.append(
+                (
+                    batch_id,
+                    perf_id,
+                    str(row.get("airfoil_id", "")).strip(),
+                    required_int(row, "version_id"),
+                    required_float(row, "alpha_deg"),
+                    required_int(row, "reynolds_number"),
+                    required_float(row, "cl"),
+                    required_float(row, "cd"),
+                    required_float(row, "cm"),
+                    str(row.get("source_type", "generated_synthetic")).strip() or "generated_synthetic",
+                    required_int(row, "is_anomaly"),
+                )
+            )
+            perf_ids.append(perf_id)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    start = time.perf_counter()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM performance_import_staging WHERE batch_id COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci",
+                (batch_id,),
+            )
+            cur.executemany(
+                """
+                INSERT INTO performance_import_staging
+                    (batch_id, perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                parsed_rows,
+            )
+        conn.commit()
+    except pymysql.MySQLError as exc:
+        conn.rollback()
+        release_db_connection(conn)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed staging batch {batch_id}", "INSERT INTO performance_import_staging", 0, elapsed_ms)
+        return jsonify({"error": friendly_mysql_error(exc, "performance_import_staging")}), 400
+    finally:
+        if conn.open:
+            conn.close()
+
+    try:
+        result_sets = query_result_sets("CALL sp_import_performance_batch(%s)", (batch_id,))
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed import batch {batch_id}", "CALL sp_import_performance_batch", 0, elapsed_ms)
+        return jsonify({"error": friendly_mysql_error(exc, "performance_records")}), 400
+
+    placeholders = ", ".join(["%s"] * len(perf_ids))
+    imported_rows = query_all(
+        f"""
+        SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm
+        FROM performance_records
+        WHERE perf_id IN ({placeholders})
+        ORDER BY perf_id
+        """,
+        tuple(perf_ids),
+    )
+    staged_rows = query_all(
+        """
+        SELECT staging_id, perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, validation_error, imported
+        FROM performance_import_staging
+        WHERE batch_id COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci
+        ORDER BY staging_id
+        """,
+        (batch_id,),
+    )
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    status_rows = result_sets[0] if result_sets else []
+    ok = bool(status_rows and status_rows[0].get("status") == "imported")
+    for row in imported_rows:
+        record_pk, airfoil_id, version_id, source_type, source_version = batch_record_identity("performance_records", row)
+        log_data_import(
+            "performance_records",
+            record_pk,
+            "frontend",
+            user,
+            airfoil_id=airfoil_id,
+            version_id=version_id,
+            source_type=source_type,
+            description=f"batch_id={batch_id}; staging_procedure_import",
+        )
+        mark_lineage_insert("performance_records", record_pk, airfoil_id, source_version)
+    log_user_action(user["user_id"], f"Performance batch import {batch_id}", "CALL sp_import_performance_batch", 1 if ok else 0, elapsed_ms)
+    return jsonify(
+        {
+            "batch_id": batch_id,
+            "target_table": "performance_records",
+            "elapsed_ms": elapsed_ms,
+            "sections": [
+                {"title": "Header validation", "rows": [{"target_table": "performance_records", "expected_header": ", ".join(BATCH_IMPORT_COLUMNS["performance_records"]), "status": "matched"}]},
+                {"title": "Procedure status", "rows": status_rows},
+                {"title": "Rejected rows", "rows": result_sets[1] if len(result_sets) > 1 else []},
+                {"title": "Staging rows", "rows": staged_rows},
+                {"title": "Imported rows", "rows": imported_rows},
+            ],
+        }
+    )
+
+
+@app.post("/api/batch_import/run")
+def run_batch_import() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+    payload = request.get_json(silent=True) or {}
+    try:
+        table_name, batch_id, columns, rows = validate_batch_payload(payload)
+        if table_name == "performance_records":
+            return import_performance_batch(user, payload)
+        return jsonify(import_generic_batch(table_name, batch_id, columns, rows, user))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/performance_import/run")
+def run_performance_import() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    batch_id = str(payload.get("batch_id", "")).strip()
+    rows = payload.get("rows", [])
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", batch_id):
+        return jsonify({"error": "batch_id must be 1-64 letters, numbers, underscores, or dashes"}), 400
+    if not isinstance(rows, list) or not rows or len(rows) > MAX_BATCH_IMPORT_ROWS:
+        return jsonify({"error": "rows must contain 1-10000 records"}), 400
+
+    parsed_rows: list[tuple[Any, ...]] = []
+    perf_ids: list[int] = []
+    try:
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("each row must be an object")
+            perf_id = required_int(row, "perf_id")
+            parsed_rows.append(
+                (
+                    batch_id,
+                    perf_id,
+                    str(row.get("airfoil_id", "")).strip(),
+                    required_int(row, "version_id"),
+                    required_float(row, "alpha_deg"),
+                    required_int(row, "reynolds_number"),
+                    required_float(row, "cl"),
+                    required_float(row, "cd"),
+                    required_float(row, "cm"),
+                    str(row.get("source_type", "generated_synthetic")).strip() or "generated_synthetic",
+                    required_int(row, "is_anomaly"),
+                )
+            )
+            perf_ids.append(perf_id)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    start = time.perf_counter()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM performance_import_staging WHERE batch_id COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci",
+                (batch_id,),
+            )
+            cur.executemany(
+                """
+                INSERT INTO performance_import_staging
+                    (batch_id, perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                parsed_rows,
+            )
+        conn.commit()
+    except pymysql.MySQLError as exc:
+        conn.rollback()
+        release_db_connection(conn)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed staging batch {batch_id}", "INSERT INTO performance_import_staging", 0, elapsed_ms)
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        if conn.open:
+            conn.close()
+
+    try:
+        result_sets = query_result_sets("CALL sp_import_performance_batch(%s)", (batch_id,))
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed import batch {batch_id}", "CALL sp_import_performance_batch", 0, elapsed_ms)
+        return jsonify({"error": str(exc)}), 400
+
+    placeholders = ", ".join(["%s"] * len(perf_ids))
+    imported_rows = query_all(
+        f"""
+        SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm
+        FROM performance_records
+        WHERE perf_id IN ({placeholders})
+        ORDER BY perf_id
+        """,
+        tuple(perf_ids),
+    )
+    staged_rows = query_all(
+        """
+        SELECT staging_id, perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, validation_error, imported
+        FROM performance_import_staging
+        WHERE batch_id COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci
+        ORDER BY staging_id
+        """,
+        (batch_id,),
+    )
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    status_rows = result_sets[0] if result_sets else []
+    ok = bool(status_rows and status_rows[0].get("status") == "imported")
+    log_user_action(user["user_id"], f"Performance batch import {batch_id}", "CALL sp_import_performance_batch", 1 if ok else 0, elapsed_ms)
+    return jsonify(
+        {
+            "batch_id": batch_id,
+            "elapsed_ms": elapsed_ms,
+            "sections": [
+                {"title": "Procedure status", "rows": status_rows},
+                {"title": "Rejected rows", "rows": result_sets[1] if len(result_sets) > 1 else []},
+                {"title": "Staging rows", "rows": staged_rows},
+                {"title": "Imported rows", "rows": imported_rows},
+            ],
+        }
+    )
+
+
+@app.post("/api/data_governance/run")
+def run_data_governance() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    scenario = str(payload.get("scenario", "")).strip()
+    airfoil_filter = str(payload.get("airfoil_id", "")).strip()
+    perf_id_filter = int(payload.get("perf_id", 0) or 0)
+    limit_count = min(max(int(payload.get("limit", 80) or 80), 1), 500)
+    start = time.perf_counter()
+    sections: list[dict[str, Any]] = []
+
+    if scenario == "record":
+        perf_where = []
+        perf_params: list[Any] = []
+        if airfoil_filter:
+            perf_where.append("p.airfoil_id = %s")
+            perf_params.append(airfoil_filter)
+        if perf_id_filter > 0:
+            perf_where.append("p.perf_id = %s")
+            perf_params.append(perf_id_filter)
+        perf_where_sql = "WHERE " + " AND ".join(perf_where) if perf_where else ""
+        perf_params.append(limit_count)
+
+        airfoil_where_sql = "WHERE a.airfoil_id = %s" if airfoil_filter else ""
+        airfoil_params: list[Any] = [airfoil_filter] if airfoil_filter else []
+        airfoil_params.append(limit_count)
+
+        sections = [
+            {
+                "title": "记录级治理：performance_records",
+                "note": "每条 performance_records 都展示所属版本、来源、异常状态、异常规则和审计次数。",
+                "rows": query_all(
+                    f"""
+                    SELECT
+                        p.perf_id,
+                        p.airfoil_id,
+                        a.name AS airfoil_name,
+                        p.version_id,
+                        dv.version_type,
+                        dv.coordinate_source_type,
+                        p.source_type AS performance_source,
+                        p.alpha_deg,
+                        p.reynolds_number,
+                        p.cl,
+                        p.cd,
+                        p.cm,
+                        p.is_anomaly,
+                        ar.anomaly_id,
+                        ar.rule_type,
+                        COALESCE(audit.audit_count, 0) AS audit_count
+                    FROM performance_records p
+                    JOIN airfoils a
+                        ON a.airfoil_id = p.airfoil_id
+                    JOIN data_versions dv
+                        ON dv.airfoil_id = p.airfoil_id
+                       AND dv.version_id = p.version_id
+                    LEFT JOIN anomaly_records ar
+                        ON ar.perf_id = p.perf_id
+                    LEFT JOIN (
+                        SELECT record_pk, COUNT(*) AS audit_count
+                        FROM audit_logs
+                        WHERE table_name = 'performance_records'
+                        GROUP BY record_pk
+                    ) audit
+                        ON audit.record_pk = CAST(p.perf_id AS CHAR)
+                    {perf_where_sql}
+                    ORDER BY p.is_anomaly DESC, p.perf_id
+                    LIMIT %s
+                    """,
+                    tuple(perf_params),
+                ),
+            },
+            {
+                "title": "记录级治理：airfoils",
+                "note": "每条 airfoils 主记录都展示真实来源、增强状态、版本数量、性能记录数量和异常数量。",
+                "rows": query_all(
+                    f"""
+                    SELECT
+                        a.airfoil_id,
+                        a.name,
+                        a.source_type,
+                        ds.description AS source_description,
+                        a.source_file,
+                        a.has_augmented_coordinates,
+                        a.original_point_count,
+                        a.final_point_count,
+                        COUNT(DISTINCT dv.version_id) AS version_count,
+                        COUNT(DISTINCT p.perf_id) AS performance_count,
+                        COUNT(DISTINCT ar.anomaly_id) AS anomaly_count
+                    FROM airfoils a
+                    JOIN data_sources ds
+                        ON ds.source_type = a.source_type
+                    LEFT JOIN data_versions dv
+                        ON dv.airfoil_id = a.airfoil_id
+                    LEFT JOIN performance_records p
+                        ON p.airfoil_id = a.airfoil_id
+                    LEFT JOIN anomaly_records ar
+                        ON ar.perf_id = p.perf_id
+                    GROUP BY
+                        a.airfoil_id,
+                        a.name,
+                        a.source_type,
+                        ds.description,
+                        a.source_file,
+                        a.has_augmented_coordinates,
+                        a.original_point_count,
+                        a.final_point_count
+                    {airfoil_where_sql}
+                    ORDER BY anomaly_count DESC, a.airfoil_id
+                    LIMIT %s
+                    """,
+                    tuple(airfoil_params),
+                ),
+            },
+        ]
+    elif scenario == "anomaly":
+        sections = [
+            {
+                "title": "异常规则分布：anomaly_records",
+                "note": "异常记录已经单独写入 anomaly_records，并通过触发器保证只能引用 is_anomaly = 1 的性能记录。",
+                "rows": query_all(
+                    """
+                    SELECT rule_type, COUNT(*) AS anomaly_count
+                    FROM anomaly_records
+                    GROUP BY rule_type
+                    ORDER BY anomaly_count DESC, rule_type
+                    """
+                ),
+            },
+            {
+                "title": "异常详情样例：v_anomaly_details",
+                "note": "该视图由 anomaly_records 关联 performance_records 与 airfoils 得到，用于查看异常记录对应的翼型和性能值。",
+                "rows": query_all(
+                    """
+                    SELECT anomaly_id, airfoil_id, airfoil_name, rule_type, alpha_deg,
+                           reynolds_number, cl, cd, ROUND(lift_drag_ratio, 6) AS lift_drag_ratio
+                    FROM v_anomaly_details
+                    ORDER BY anomaly_id
+                    LIMIT 20
+                    """
+                ),
+            },
+        ]
+    elif scenario == "version":
+        sections = [
+            {
+                "title": "版本追踪：data_versions JOIN airfoils",
+                "note": "data_versions 记录每条几何数据来自哪个版本，以及是否由原始数据增强得到。",
+                "rows": query_all(
+                    """
+                    SELECT dv.airfoil_id, a.name, dv.version_id, dv.version_type,
+                           dv.coordinate_source_type, dv.description
+                    FROM data_versions dv
+                    JOIN airfoils a ON a.airfoil_id = dv.airfoil_id
+                    ORDER BY dv.airfoil_id, dv.version_id
+                    LIMIT 30
+                    """
+                ),
+            },
+            {
+                "title": "版本汇总：data_versions",
+                "note": "按 version_type 与 coordinate_source_type 汇总 data_versions 中的版本记录。",
+                "rows": query_all(
+                    """
+                    SELECT version_type, coordinate_source_type, COUNT(*) AS version_count
+                    FROM data_versions
+                    GROUP BY version_type, coordinate_source_type
+                    ORDER BY version_count DESC
+                    """
+                ),
+            },
+        ]
+    elif scenario == "source":
+        sections = [
+            {
+                "title": "数据来源说明：data_sources",
+                "note": "data_sources 区分真实 UIUC 坐标、增强坐标、合成性能数据、注入异常数据。",
+                "rows": query_all(
+                    """
+                    SELECT source_type, description
+                    FROM data_sources
+                    ORDER BY source_type
+                    """
+                ),
+            },
+            {
+                "title": "来源使用情况：airfoils",
+                "note": "统计 airfoils 中各 source_type 的使用数量。",
+                "rows": query_all(
+                    """
+                    SELECT source_type, COUNT(*) AS airfoil_count
+                    FROM airfoils
+                    GROUP BY source_type
+                    ORDER BY airfoil_count DESC, source_type
+                    """
+                ),
+            },
+        ]
+    elif scenario == "delete":
+        sections = [
+            {
+                "title": "删除策略说明：核心关系策略",
+                "note": "核心工程数据不建议直接物理删除；依赖数据通过外键约束维护一致性，审计和查询日志用于保留操作证据。",
+                "rows": [
+                    {"data_type": "airfoils / data_versions / coordinate_points", "strategy": "核心工程数据，演示环境依赖外键 CASCADE；生产环境建议逻辑删除。"},
+                    {"data_type": "performance_records", "strategy": "分析数据不建议直接删除；修改会触发 audit_logs 记录。"},
+                    {"data_type": "anomaly_records", "strategy": "异常标记可修正；必须引用 is_anomaly = 1 的性能记录。"},
+                    {"data_type": "query_logs / audit_logs", "strategy": "治理证据与审计记录，不建议删除。"},
+                    {"data_type": "saved_transactions", "strategy": "用户私有事务脚本，允许用户删除自己的保存项。"},
+                ],
+            },
+            {
+                "title": "外键删除规则：information_schema.referential_constraints",
+                "rows": query_all(
+                    """
+                    SELECT table_name, constraint_name, referenced_table_name, delete_rule
+                    FROM information_schema.referential_constraints
+                    WHERE constraint_schema = DATABASE()
+                    ORDER BY table_name, constraint_name
+                    """
+                ),
+            },
+        ]
+    else:
+        return jsonify({"error": "unknown scenario"}), 400
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Ran data governance scenario {scenario}", f"DATA_GOVERNANCE {scenario}", 1, elapsed_ms)
+    return jsonify({"scenario": scenario, "elapsed_ms": elapsed_ms, "sections": sections})
+
+
+@app.get("/query_logs/<int:log_id>/sql")
+def query_log_sql_page(log_id: int) -> Any:
+    role = current_role()
+    if not is_manager(role):
+        return "manager permission required", 403
+    rows = query_all(
+        """
+        SELECT q.log_id, q.user_id, u.username, q.natural_language, q.sql_text,
+               q.is_valid, q.execution_time_ms, q.executed_at
+        FROM query_logs q
+        JOIN users u ON u.user_id = q.user_id
+        WHERE q.log_id = %s
+        """,
+        (log_id,),
+    )
+    if not rows:
+        return "query log not found", 404
+    row = rows[0]
+    return render_template_string(
+        """
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>QueryLog {{ row.log_id }}</title>
+          <style>
+            body { margin:0; padding:24px; font-family:"Segoe UI",Arial,"Microsoft YaHei",sans-serif; color:#172033; background:#f7f8fb; }
+            .card { max-width:1100px; margin:0 auto; background:#fff; border:1px solid #d8dde8; border-radius:8px; padding:18px; box-shadow:0 8px 22px rgba(26,34,55,.08); }
+            h1 { margin:0 0 12px; font-size:20px; }
+            .meta { display:flex; flex-wrap:wrap; gap:8px 18px; color:#62708a; font-size:13px; margin-bottom:14px; }
+            pre { margin:0; white-space:pre-wrap; word-break:break-word; border:1px solid #d8dde8; border-radius:6px; background:#fbfcff; padding:14px; font-family:Consolas,monospace; font-size:13px; line-height:1.5; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>QueryLog #{{ row.log_id }}</h1>
+            <div class="meta">
+              <span>User: {{ row.username }}</span>
+              <span>Valid: {{ row.is_valid }}</span>
+              <span>Time: {{ row.execution_time_ms }} ms</span>
+              <span>Executed: {{ row.executed_at }}</span>
+            </div>
+            <pre>{{ row.sql_text }}</pre>
+          </div>
+        </body>
+        </html>
+        """,
+        row=row,
+    )
+
+
+@app.post("/api/query_logs/run")
+def run_logged_query() -> Any:
+    user = current_user()
+    if not user:
+        return jsonify({"error": "please login first"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    sql = str(payload.get("sql", "")).strip()
+    natural_language = str(payload.get("natural_language", "")).strip() or None
+    role = user["role"]
+
+    allowed = is_allowed_editor_sql(sql) if is_admin(role) else is_safe_select(sql)
+    if not allowed:
+        log_user_action(user["user_id"], natural_language, sql, 0)
+        if is_admin(role):
+            return jsonify({"error": "only safe single SQL statements are allowed"}), 400
+        return jsonify({"error": "non-admin users can only run SELECT or EXPLAIN SELECT"}), 400
+
+    start = time.perf_counter()
+    rows: list[dict[str, Any]] = []
+    explain_rows: list[dict[str, Any]] = []
+    affected_rows: int | None = None
+    error: str | None = None
+    is_valid = 0
+    conn = get_db_connection()
+    try:
+        normalized = sql.strip().lower()
+        statement = sql.rstrip(";")
+        with conn.cursor() as cur:
+            if (
+                normalized.startswith("select")
+                or normalized.startswith("explain select")
+                or normalized.startswith("call ")
+            ):
+                cur.execute(statement)
+                rows = list(cur.fetchall())
+                if normalized.startswith("select"):
+                    cur.execute("EXPLAIN " + statement)
+                    explain_rows = list(cur.fetchall())
+            else:
+                affected_rows = cur.execute(statement)
+                rows = [{"affected_rows": affected_rows}]
+                inferred_import = infer_sql_import_target(statement)
+                if inferred_import and affected_rows:
+                    table_name, record_pk = inferred_import
+                    cur.execute(
+                        """
+                        INSERT INTO data_import_records
+                            (target_table, record_pk, entry_method, created_by_user_id, created_by_username, description)
+                        VALUES (%s, %s, 'sql', %s, %s, %s)
+                        """,
+                        (table_name, record_pk, user["user_id"], user["username"], statement[:1000]),
+                    )
+            is_valid = 1
+    except Exception as exc:
+        conn.rollback()
+        error = str(exc)
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO query_logs
+                    (user_id, natural_language, sql_text, is_ai_generated, is_valid, execution_time_ms)
+                VALUES (%s, %s, %s, 0, %s, %s)
+                """,
+                (user["user_id"], natural_language, sql, is_valid, elapsed_ms),
+            )
+        conn.commit()
+    finally:
+        release_db_connection(conn)
+
+    if error:
+        return jsonify({"error": error, "elapsed_ms": elapsed_ms, "rows": []}), 400
+    return jsonify(
+        {
+            "elapsed_ms": elapsed_ms,
+            "row_count": len(rows),
+            "affected_rows": affected_rows,
+            "explain": explain_rows,
+            "rows": rows[:100],
+        }
+    )
+
+
+@app.post("/api/airfoils/create")
+def create_airfoil() -> Any:
+    user = current_user()
+    if not user:
+        return jsonify({"error": "please login first"}), 401
+    if not is_manager(user["role"]):
+        log_user_action(user["user_id"], "Rejected graphical airfoil creation", "INSERT INTO airfoils (...)", 0)
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    airfoil_id = str(payload.get("airfoil_id", "")).strip().lower()
+    name = str(payload.get("name", "")).strip()
+    family = str(payload.get("family", "Manual")).strip() or "Manual"
+    source_type = str(payload.get("source_type", "uiuc_raw")).strip()
+    source = str(payload.get("source", "Manual Input")).strip() or "Manual Input"
+    source_file = str(payload.get("source_file", f"manual\\{airfoil_id}.dat")).strip()
+    original_point_count = int(payload.get("original_point_count") or 1)
+    final_point_count = int(payload.get("final_point_count") or original_point_count)
+
+    if not re.fullmatch(r"[a-z0-9_]{2,64}", airfoil_id):
+        log_user_action(user["user_id"], "Rejected graphical airfoil creation: invalid airfoil_id", "INSERT INTO airfoils (...)", 0)
+        return jsonify({"error": "invalid airfoil_id"}), 400
+    if not name:
+        log_user_action(user["user_id"], "Rejected graphical airfoil creation: empty name", "INSERT INTO airfoils (...)", 0)
+        return jsonify({"error": "name is required"}), 400
+    if final_point_count < original_point_count:
+        return jsonify({"error": "final_point_count must be >= original_point_count"}), 400
+
+    try:
+        execute_write(
+            """
+            INSERT INTO airfoils
+                (airfoil_id, name, source, family, is_generated, source_type, source_file,
+                 has_augmented_coordinates, original_point_count, final_point_count)
+            VALUES (%s, %s, %s, %s, 0, %s, %s, 0, %s, %s)
+            """,
+            (airfoil_id, name, source, family, source_type, source_file, original_point_count, final_point_count),
+        )
+    except pymysql.err.IntegrityError as exc:
+        log_user_action(user["user_id"], f"Rejected graphical airfoil creation: {airfoil_id}", f"INSERT INTO airfoils (...) VALUES ('{airfoil_id}', ...)", 0)
+        return jsonify({"error": str(exc)}), 409
+
+    log_user_action(user["user_id"], f"Graphically created airfoil {airfoil_id}", f"INSERT INTO airfoils (...) VALUES ('{airfoil_id}', ...)", 1)
+    log_data_import(
+        "airfoils",
+        airfoil_id,
+        "frontend",
+        user,
+        airfoil_id=airfoil_id,
+        source_type=source_type,
+        description=f"{name}; {source_file}",
+    )
+    return jsonify({"ok": True, "airfoil_id": airfoil_id})
+
+
+@app.post("/api/main_records/create")
+def create_main_record() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+    payload = request.get_json(silent=True) or {}
+    table_name = str(payload.get("table", "")).strip()
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        return jsonify({"error": "data must be an object"}), 400
+
+    start = time.perf_counter()
+    try:
+        if table_name == "data_sources":
+            source_type = str(data.get("source_type", "")).strip()
+            description = str(data.get("description", "")).strip()
+            if source_type not in {"uiuc_raw", "uiuc_raw_with_tracked_augmentation", "generated_synthetic", "injected_anomaly"}:
+                return jsonify({"error": "invalid source_type"}), 400
+            if not description:
+                return jsonify({"error": "description is required"}), 400
+            execute_write(
+                "INSERT INTO data_sources (source_type, description) VALUES (%s, %s)",
+                (source_type, description),
+            )
+            record_pk = source_type
+            log_data_import("data_sources", record_pk, "frontend", user, source_type=source_type, description=description)
+            mark_lineage_insert("data_sources", record_pk, None, "source")
+        elif table_name == "airfoils":
+            airfoil_id = str(data.get("airfoil_id", "")).strip().lower()
+            name = str(data.get("name", "")).strip()
+            source = str(data.get("source", "Frontend Input")).strip() or "Frontend Input"
+            family = str(data.get("family", "Manual")).strip() or "Manual"
+            source_type = str(data.get("source_type", "uiuc_raw")).strip()
+            source_file = str(data.get("source_file", f"frontend\\{airfoil_id}.dat")).strip()
+            original_point_count = int(data.get("original_point_count") or 1)
+            final_point_count = int(data.get("final_point_count") or original_point_count)
+            if not re.fullmatch(r"[a-z0-9_]{2,64}", airfoil_id):
+                return jsonify({"error": "invalid airfoil_id"}), 400
+            if not name:
+                return jsonify({"error": "name is required"}), 400
+            if final_point_count < original_point_count:
+                return jsonify({"error": "final_point_count must be >= original_point_count"}), 400
+            execute_write(
+                """
+                INSERT INTO airfoils
+                    (airfoil_id, name, source, family, is_generated, source_type, source_file,
+                     has_augmented_coordinates, original_point_count, final_point_count)
+                VALUES (%s, %s, %s, %s, 0, %s, %s, 0, %s, %s)
+                """,
+                (airfoil_id, name, source, family, source_type, source_file, original_point_count, final_point_count),
+            )
+            record_pk = airfoil_id
+            log_data_import("airfoils", record_pk, "frontend", user, airfoil_id=airfoil_id, source_type=source_type, description=f"{name}; {source_file}")
+            mark_lineage_insert("airfoils", record_pk, airfoil_id, "master")
+        elif table_name == "data_versions":
+            airfoil_id = str(data.get("airfoil_id", "")).strip().lower()
+            version_id = int(data.get("version_id") or 1)
+            version_type = str(data.get("version_type", "imported_raw")).strip()
+            coordinate_source_type = str(data.get("coordinate_source_type", "real_only")).strip()
+            description = str(data.get("description", "")).strip() or "Frontend created data version"
+            if version_type not in {"imported_raw", "augmented_from_raw"}:
+                return jsonify({"error": "invalid version_type"}), 400
+            if coordinate_source_type not in {"real_only", "mixed_real_and_augmented"}:
+                return jsonify({"error": "invalid coordinate_source_type"}), 400
+            execute_write(
+                """
+                INSERT INTO data_versions
+                    (airfoil_id, version_id, version_type, coordinate_source_type, description)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (airfoil_id, version_id, version_type, coordinate_source_type, description),
+            )
+            record_pk = f"{airfoil_id}#{version_id}"
+            log_data_import("data_versions", record_pk, "frontend", user, airfoil_id=airfoil_id, version_id=version_id, description=description)
+            mark_lineage_insert("data_versions", record_pk, airfoil_id, f"version {version_id}")
+        elif table_name == "coordinate_points":
+            airfoil_id = str(data.get("airfoil_id", "")).strip().lower()
+            version_id = int(data.get("version_id") or 1)
+            point_order = int(data.get("point_order") or 1)
+            x_value = float(data.get("x"))
+            y_value = float(data.get("y"))
+            surface = str(data.get("surface", "upper")).strip()
+            point_source = str(data.get("point_source", "real")).strip()
+            is_augmented = int(data.get("is_augmented") or 0)
+            original_order_raw = str(data.get("original_order", "")).strip()
+            original_order = None if original_order_raw == "" else int(original_order_raw)
+            augmentation_method = str(data.get("augmentation_method", "original_coordinate")).strip()
+            if surface not in {"upper", "lower"}:
+                return jsonify({"error": "surface 只能选择 upper 或 lower"}), 400
+            if point_source not in {"real", "augmented"}:
+                return jsonify({"error": "point_source 只能选择 real 或 augmented"}), 400
+            if is_augmented not in {0, 1}:
+                return jsonify({"error": "is_augmented 只能填写 0 或 1"}), 400
+            if augmentation_method not in {"original_coordinate", "linear_interpolation"}:
+                return jsonify({"error": "augmentation_method 只能选择 original_coordinate 或 linear_interpolation"}), 400
+            if point_order < 1:
+                return jsonify({"error": "point_order 必须大于等于 1"}), 400
+            if not (-0.001 <= x_value <= 1.001):
+                return jsonify({"error": "x 坐标必须在 -0.001 到 1.001 之间"}), 400
+            if point_source == "real" and (is_augmented != 0 or augmentation_method != "original_coordinate"):
+                return jsonify({"error": "真实坐标点必须满足：point_source=real、is_augmented=0、augmentation_method=original_coordinate"}), 400
+            if point_source == "augmented" and (is_augmented != 1 or augmentation_method != "linear_interpolation"):
+                return jsonify({"error": "增强坐标点必须满足：point_source=augmented、is_augmented=1、augmentation_method=linear_interpolation"}), 400
+            execute_write(
+                """
+                INSERT INTO coordinate_points
+                    (airfoil_id, version_id, point_order, x, y, surface, point_source,
+                     is_augmented, original_order, augmentation_method)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    airfoil_id,
+                    version_id,
+                    point_order,
+                    x_value,
+                    y_value,
+                    surface,
+                    point_source,
+                    is_augmented,
+                    original_order,
+                    augmentation_method,
+                ),
+            )
+            record_pk = f"{airfoil_id}#{version_id}#{point_order}"
+            log_data_import(
+                "coordinate_points",
+                record_pk,
+                "frontend",
+                user,
+                airfoil_id=airfoil_id,
+                version_id=version_id,
+                description=f"point_order={point_order}; x={x_value}; y={y_value}",
+            )
+            mark_lineage_insert("coordinate_points", record_pk, airfoil_id, f"version {version_id}")
+        else:
+            return jsonify({"error": "only data_sources, airfoils, data_versions, and coordinate_points can be added here"}), 400
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed frontend create {table_name}", f"INSERT INTO {table_name}", 0, elapsed_ms)
+        return jsonify({"error": friendly_mysql_error(exc, table_name), "mysql_error": str(exc)}), 400
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Frontend created {table_name}.{record_pk}", f"INSERT INTO {table_name}", 1, elapsed_ms)
+    if table_name == "data_sources":
+        rows = query_all("SELECT * FROM data_sources WHERE source_type = %s", (record_pk,))
+    elif table_name == "airfoils":
+        rows = query_all("SELECT * FROM airfoils WHERE airfoil_id = %s", (record_pk,))
+    elif table_name == "data_versions":
+        rows = query_all("SELECT * FROM data_versions WHERE airfoil_id = %s AND version_id = %s", (airfoil_id, version_id))
+    else:
+        rows = query_all(
+            "SELECT * FROM coordinate_points WHERE airfoil_id = %s AND version_id = %s AND point_order = %s",
+            (airfoil_id, version_id, point_order),
+        )
+    return jsonify({"ok": True, "table": table_name, "record_pk": record_pk, "elapsed_ms": elapsed_ms, "rows": rows})
+
+
+@app.post("/api/main_records/delete")
+def soft_delete_main_record() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+    payload = request.get_json(silent=True) or {}
+    table_name = str(payload.get("table", "")).strip()
+    row = payload.get("row", {})
+    reason = str(payload.get("reason", "")).strip()
+    if table_name not in SOFT_DELETE_TARGET_TABLES:
+        return jsonify({"error": "当前关系不支持逻辑删除"}), 400
+    if not isinstance(row, dict):
+        return jsonify({"error": "row must be an object"}), 400
+
+    start = time.perf_counter()
+    try:
+        where_sql, params = row_identity_where(table_name, row)
+        current_rows = query_all(
+            f"""
+            SELECT *
+            FROM `{table_name}`
+            WHERE {where_sql}
+              AND {soft_delete_filter_sql(table_name)}
+            LIMIT 1
+            """,
+            params,
+        )
+        if not current_rows:
+            return jsonify({"error": "记录不存在，或已经被逻辑删除"}), 404
+        current = current_rows[0]
+        record_pk = record_pk_from_row(table_name, current)
+        airfoil_id = current.get("airfoil_id")
+        version_id = current.get("version_id")
+        source_version = "source"
+        if table_name == "airfoils":
+            source_version = "master"
+        elif version_id not in (None, ""):
+            source_version = f"version {version_id}"
+        delete_record_version_id = current_record_version_id(table_name, record_pk) + 1
+        row_snapshot = json.dumps(current, ensure_ascii=False, default=str)
+        active_delete = query_all(
+            """
+            SELECT delete_id
+            FROM soft_delete_records
+            WHERE table_name = %s AND record_pk = %s AND is_active = 1
+            LIMIT 1
+            """,
+            (table_name, record_pk),
+        )
+        if active_delete:
+            affected = execute_write(
+                """
+                UPDATE soft_delete_records
+                SET airfoil_id = %s,
+                    version_id = %s,
+                    record_version_id = %s,
+                    row_snapshot = %s,
+                    delete_reason = %s,
+                    deleted_by_user_id = %s,
+                    deleted_by_username = %s,
+                    deleted_at = CURRENT_TIMESTAMP,
+                    restored_by_user_id = NULL,
+                    restored_by_username = NULL,
+                    restored_at = NULL
+                WHERE delete_id = %s
+                """,
+                (
+                    airfoil_id,
+                    version_id,
+                    delete_record_version_id,
+                    row_snapshot,
+                    reason or "frontend logical delete",
+                    user["user_id"],
+                    user["username"],
+                    active_delete[0]["delete_id"],
+                ),
+            )
+        else:
+            affected = execute_write(
+                """
+                INSERT INTO soft_delete_records
+                    (table_name, record_pk, record_version_id, airfoil_id, version_id, row_snapshot,
+                     delete_reason, deleted_by_user_id, deleted_by_username, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                """,
+                (
+                    table_name,
+                    record_pk,
+                    delete_record_version_id,
+                    airfoil_id,
+                    version_id,
+                    row_snapshot,
+                    reason or "frontend logical delete",
+                    user["user_id"],
+                    user["username"],
+                ),
+            )
+        mark_lineage_deleted(table_name, record_pk, airfoil_id, source_version, user)
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed logical delete {table_name}", f"SOFT DELETE {table_name}", 0, elapsed_ms)
+        return jsonify({"error": friendly_mysql_error(exc, table_name), "mysql_error": str(exc)}), 400
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": f"逻辑删除失败：缺少主键字段或字段格式错误：{exc}"}), 400
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Logical deleted {table_name}.{record_pk}", f"SOFT DELETE {table_name}", 1, elapsed_ms)
+    return jsonify(
+        {
+            "ok": True,
+            "table": table_name,
+            "record_pk": record_pk,
+            "record_version_id": delete_record_version_id,
+            "affected_rows": affected,
+            "elapsed_ms": elapsed_ms,
+            "rows": current_rows,
+        }
+    )
+
+
+@app.post("/api/main_records/restore")
+def restore_main_record() -> Any:
+    user = current_user()
+    if not user or user["role"] != "admin":
+        return jsonify({"error": "admin permission required"}), 403
+    payload = request.get_json(silent=True) or {}
+    try:
+        delete_id = required_int(payload, "delete_id")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    start = time.perf_counter()
+    rows = query_all(
+        """
+        SELECT delete_id, table_name, record_pk, airfoil_id, version_id, is_active
+        FROM soft_delete_records
+        WHERE delete_id = %s
+        """,
+        (delete_id,),
+    )
+    if not rows:
+        return jsonify({"error": "逻辑删除记录不存在"}), 404
+    record = rows[0]
+    if int(record.get("is_active", 0)) != 1:
+        return jsonify({"error": "该记录已经恢复，无需重复恢复"}), 400
+
+    table_name = record["table_name"]
+    record_pk = record["record_pk"]
+    version_id = record.get("version_id")
+    source_version = "source"
+    if table_name == "airfoils":
+        source_version = "master"
+    elif version_id not in (None, ""):
+        source_version = f"version {version_id}"
+
+    try:
+        affected = execute_write(
+            """
+            UPDATE soft_delete_records
+            SET is_active = 0,
+                restored_by_user_id = %s,
+                restored_by_username = %s,
+                restored_at = CURRENT_TIMESTAMP
+            WHERE delete_id = %s AND is_active = 1
+            """,
+            (user["user_id"], user["username"], delete_id),
+        )
+        mark_lineage_restored(table_name, record_pk, record.get("airfoil_id"), source_version, user)
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed restore {table_name}.{record_pk}", "RESTORE SOFT DELETE", 0, elapsed_ms)
+        return jsonify({"error": friendly_mysql_error(exc, table_name), "mysql_error": str(exc)}), 400
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Restored {table_name}.{record_pk}", "RESTORE SOFT DELETE", 1 if affected else 0, elapsed_ms)
+    return jsonify(
+        {
+            "ok": True,
+            "delete_id": delete_id,
+            "table": table_name,
+            "record_pk": record_pk,
+            "affected_rows": affected,
+            "elapsed_ms": elapsed_ms,
+        }
+    )
+
+
+@app.get("/api/saved_transactions")
+def list_saved_transactions() -> Any:
+    user = current_user()
+    if not user:
+        return jsonify({"error": "please login first"}), 401
+    rows = query_all(
+        """
+        SELECT saved_id, title, sql_text, created_at, updated_at
+        FROM saved_transactions
+        WHERE user_id = %s
+        ORDER BY updated_at DESC, saved_id DESC
+        """,
+        (user["user_id"],),
+    )
+    return jsonify(rows)
+
+
+@app.post("/api/saved_transactions/save")
+def save_transaction() -> Any:
+    user = current_user()
+    if not user:
+        return jsonify({"error": "please login first"}), 401
+    payload = request.get_json(silent=True) or {}
+    title = str(payload.get("title", "")).strip()
+    sql_text = str(payload.get("sql", "")).strip()
+    if not title or len(title) > 128:
+        return jsonify({"error": "title must be 1-128 characters"}), 400
+    statements = split_sql_statements(sql_text)
+    if not statements:
+        return jsonify({"error": "transaction SQL is empty"}), 400
+    if len(statements) > 20:
+        return jsonify({"error": "at most 20 statements per saved transaction"}), 400
+    if any(not is_allowed_transaction_sql(statement) for statement in statements):
+        return jsonify({"error": "saved transaction only allows SELECT/INSERT/UPDATE/DELETE and cannot touch users/query_logs or DDL"}), 400
+
+    execute_write(
+        """
+        INSERT INTO saved_transactions (user_id, title, sql_text)
+        VALUES (%s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            sql_text = VALUES(sql_text),
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (user["user_id"], title, sql_text),
+    )
+    log_user_action(user["user_id"], f"Saved transaction {title}", "UPSERT saved_transactions", 1)
+    rows = query_all(
+        """
+        SELECT saved_id, title, sql_text, created_at, updated_at
+        FROM saved_transactions
+        WHERE user_id = %s AND title = %s
+        """,
+        (user["user_id"], title),
+    )
+    return jsonify(rows[0])
+
+
+@app.post("/api/saved_transactions/delete")
+def delete_saved_transaction() -> Any:
+    user = current_user()
+    if not user:
+        return jsonify({"error": "please login first"}), 401
+    payload = request.get_json(silent=True) or {}
+    saved_id = int(payload.get("saved_id", 0) or 0)
+    if saved_id <= 0:
+        return jsonify({"error": "invalid saved_id"}), 400
+    affected = execute_write(
+        "DELETE FROM saved_transactions WHERE saved_id = %s AND user_id = %s",
+        (saved_id, user["user_id"]),
+    )
+    log_user_action(user["user_id"], f"Deleted saved transaction {saved_id}", "DELETE FROM saved_transactions", 1 if affected else 0)
+    return jsonify({"ok": bool(affected), "deleted": affected})
+
+
+@app.post("/api/db_object_experiment/run")
+def run_db_object_experiment() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    scenario = str((request.get_json(silent=True) or {}).get("scenario", "")).strip()
+    sections: list[dict[str, Any]] = []
+    sql_log = f"DB object experiment: {scenario}"
+    start = time.perf_counter()
+
+    try:
+        if scenario == "views":
+            sections = [
+                {
+                    "title": "v_airfoil_overview",
+                    "note": "Aggregated airfoil version, coordinate, performance, and anomaly counts.",
+                    "rows": query_all(
+                        """
+                        SELECT *
+                        FROM v_airfoil_overview
+                        ORDER BY anomaly_count DESC, airfoil_id
+                        LIMIT 8
+                        """
+                    ),
+                },
+                {
+                    "title": "v_performance_with_ld",
+                    "note": "Derived lift_drag_ratio = cl / cd is exposed by the view.",
+                    "rows": query_all(
+                        """
+                        SELECT airfoil_id, alpha_deg, reynolds_number, cl, cd, ROUND(lift_drag_ratio, 6) AS lift_drag_ratio
+                        FROM v_performance_with_ld
+                        WHERE reynolds_number = 50000
+                        ORDER BY lift_drag_ratio DESC
+                        LIMIT 8
+                        """
+                    ),
+                },
+                {
+                    "title": "v_anomaly_details",
+                    "note": "Anomaly records are joined with airfoil names and performance values.",
+                    "rows": query_all(
+                        """
+                        SELECT anomaly_id, airfoil_id, airfoil_name, rule_type, cl, cd, ROUND(lift_drag_ratio, 6) AS lift_drag_ratio
+                        FROM v_anomaly_details
+                        ORDER BY anomaly_id
+                        LIMIT 8
+                        """
+                    ),
+                },
+            ]
+        elif scenario == "trigger_reject":
+            execute_write(
+                """
+                INSERT INTO performance_records
+                    (perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+                VALUES
+                    (9200001, 'ag03', 1, 2.34, 654322, 0.100, 0.010, 0.000, 'generated_synthetic', 0)
+                ON DUPLICATE KEY UPDATE
+                    airfoil_id = VALUES(airfoil_id),
+                    version_id = VALUES(version_id),
+                    alpha_deg = VALUES(alpha_deg),
+                    reynolds_number = VALUES(reynolds_number),
+                    cl = VALUES(cl),
+                    cd = VALUES(cd),
+                    cm = VALUES(cm),
+                    is_anomaly = 0
+                """
+            )
+            execute_write("DELETE FROM anomaly_records WHERE anomaly_id = 9920001")
+            expected_error = ""
+            try:
+                execute_write(
+                    """
+                    INSERT INTO anomaly_records
+                        (anomaly_id, perf_id, airfoil_id, version_id, rule_type, detail)
+                    VALUES
+                        (9920001, 9200001, 'ag03', 1, 'negative_cd', 'frontend trigger rejection demo')
+                    """
+                )
+            except pymysql.MySQLError as exc:
+                expected_error = str(exc)
+            sections = [
+                {
+                    "title": "Trigger rejection result",
+                    "note": "The trigger should reject anomaly_records when referenced performance_records.is_anomaly = 0.",
+                    "rows": [
+                        {
+                            "status": "rejected" if expected_error else "unexpectedly inserted",
+                            "expected_error": expected_error or "none",
+                        }
+                    ],
+                },
+                {
+                    "title": "Referenced performance record",
+                    "rows": query_all(
+                        """
+                        SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, is_anomaly
+                        FROM performance_records
+                        WHERE perf_id = 9200001
+                        """
+                    ),
+                },
+            ]
+        elif scenario == "trigger_audit":
+            execute_write(
+                """
+                INSERT INTO performance_records
+                    (perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+                VALUES
+                    (9200001, 'ag03', 1, 2.34, 654322, 0.100, 0.010, 0.000, 'generated_synthetic', 0)
+                ON DUPLICATE KEY UPDATE
+                    cl = 0.100,
+                    cd = 0.010,
+                    cm = 0.000,
+                    is_anomaly = 0
+                """
+            )
+            execute_write("UPDATE performance_records SET cl = cl + 0.002 WHERE perf_id = 9200001")
+            sections = [
+                {
+                    "title": "Updated performance record",
+                    "rows": query_all(
+                        """
+                        SELECT perf_id, cl, cd, cm, is_anomaly
+                        FROM performance_records
+                        WHERE perf_id = 9200001
+                        """
+                    ),
+                },
+                {
+                    "title": "Audit trigger output",
+                    "note": "trg_audit_performance_update wrote old_values and new_values automatically.",
+                    "rows": query_all(
+                        """
+                        SELECT audit_id, table_name, operation_type, record_pk, old_values, new_values, changed_at
+                        FROM audit_logs
+                        WHERE table_name = 'performance_records' AND record_pk = '9200001'
+                        ORDER BY audit_id DESC
+                        LIMIT 5
+                        """
+                    ),
+                },
+            ]
+        elif scenario == "proc_summary":
+            sections = [
+                {
+                    "title": "CALL sp_airfoil_performance_summary('ag03', 1)",
+                    "rows": query_result_sets("CALL sp_airfoil_performance_summary(%s, %s)", ("ag03", 1))[0],
+                },
+                {
+                    "title": "CALL sp_compare_airfoils_by_re(50000, 'max_ld', 10)",
+                    "rows": query_result_sets("CALL sp_compare_airfoils_by_re(%s, %s, %s)", (50000, "max_ld", 10))[0],
+                },
+            ]
+        elif scenario == "proc_import_bad":
+            execute_write("DELETE FROM performance_records WHERE perf_id IN (9900101, 9900102)")
+            execute_write(
+                "DELETE FROM performance_import_staging WHERE batch_id COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci",
+                ("demo_bad_batch",),
+            )
+            execute_write(
+                """
+                INSERT INTO performance_import_staging
+                    (batch_id, perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+                VALUES
+                    ('demo_bad_batch', 9900101, 'ag03', 1, 0, 123456, 0.5, 0.01, 0.0, 'generated_synthetic', 0),
+                    ('demo_bad_batch', 9900102, 'ag03', 1, 99, 123456, 0.6, 0.02, 0.0, 'generated_synthetic', 0)
+                """
+            )
+            result_sets = query_result_sets("CALL sp_import_performance_batch(%s)", ("demo_bad_batch",))
+            sections = [
+                {"title": "Procedure status", "rows": result_sets[0] if result_sets else []},
+                {"title": "Rejected rows", "rows": result_sets[1] if len(result_sets) > 1 else []},
+                {
+                    "title": "Formal table verification",
+                    "note": "Expected: no rows in performance_records.",
+                    "rows": query_all(
+                        """
+                        SELECT perf_id, airfoil_id, alpha_deg, reynolds_number
+                        FROM performance_records
+                        WHERE perf_id IN (9900101, 9900102)
+                        """
+                    ),
+                },
+            ]
+        elif scenario == "proc_import_good":
+            execute_write("DELETE FROM performance_records WHERE perf_id IN (9900201, 9900202)")
+            execute_write(
+                "DELETE FROM performance_import_staging WHERE batch_id COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci",
+                ("demo_good_batch",),
+            )
+            execute_write(
+                """
+                INSERT INTO performance_import_staging
+                    (batch_id, perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+                VALUES
+                    ('demo_good_batch', 9900201, 'ag03', 1, -1, 123457, 0.45, 0.012, 0.0, 'generated_synthetic', 0),
+                    ('demo_good_batch', 9900202, 'ag03', 1, 1, 123457, 0.55, 0.013, 0.0, 'generated_synthetic', 0)
+                """
+            )
+            result_sets = query_result_sets("CALL sp_import_performance_batch(%s)", ("demo_good_batch",))
+            sections = [
+                {"title": "Procedure status", "rows": result_sets[0] if result_sets else []},
+                {
+                    "title": "Imported rows in performance_records",
+                    "rows": query_all(
+                        """
+                        SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd
+                        FROM performance_records
+                        WHERE perf_id IN (9900201, 9900202)
+                        ORDER BY perf_id
+                        """
+                    ),
+                },
+            ]
+        else:
+            return jsonify({"error": "unknown scenario"}), 400
+    except pymysql.MySQLError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        log_user_action(user["user_id"], f"Failed DB object experiment {scenario}", sql_log, 0, elapsed_ms)
+        return jsonify({"error": str(exc), "scenario": scenario}), 400
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(user["user_id"], f"Ran DB object experiment {scenario}", sql_log, 1, elapsed_ms)
+    return jsonify({"scenario": scenario, "elapsed_ms": elapsed_ms, "sections": sections})
+
+
+def performance_index_exists() -> bool:
+    rows = query_all(
+        """
+        SELECT COUNT(*) AS count
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'performance_records'
+          AND index_name = 'idx_perf_reynolds_alpha'
+        """
+    )
+    return rows[0]["count"] > 0
+
+
+@app.get("/api/index_experiment/status")
+def index_experiment_status() -> Any:
+    return jsonify({"exists": performance_index_exists()})
+
+
+@app.get("/api/index_experiment/indexes")
+def index_experiment_indexes() -> Any:
+    table_name = request.args.get("table", "performance_records")
+    if table_name not in INDEX_ALLOWED_TABLES:
+        return jsonify({"error": "table is not allowed"}), 400
+    rows = query_all(
+        """
+        SELECT
+            INDEX_NAME AS index_name,
+            NON_UNIQUE AS non_unique,
+            SEQ_IN_INDEX AS seq_in_index,
+            COLUMN_NAME AS column_name,
+            INDEX_TYPE AS index_type
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+        ORDER BY index_name, seq_in_index
+        """,
+        (table_name,),
+    )
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item = grouped.setdefault(
+            row["index_name"],
+            {
+                "index_name": row["index_name"],
+                "unique": "NO" if row["non_unique"] else "YES",
+                "columns": [],
+                "index_type": row["index_type"],
+            },
+        )
+        item["columns"].append(row["column_name"])
+    return jsonify(
+        [
+            {
+                "index_name": item["index_name"],
+                "unique": item["unique"],
+                "columns": ", ".join(item["columns"]),
+                "index_type": item["index_type"],
+            }
+            for item in grouped.values()
+        ]
+    )
+
+
+@app.get("/api/index_experiment/tables")
+def index_experiment_tables() -> Any:
+    return jsonify(sorted(INDEX_ALLOWED_TABLES))
+
+
+@app.get("/api/index_experiment/columns")
+def index_experiment_columns() -> Any:
+    table_name = request.args.get("table", "")
+    columns = table_columns(table_name)
+    if not columns:
+        return jsonify({"error": "table is not allowed or has no columns"}), 400
+    return jsonify(columns)
+
+
+@app.post("/api/index_experiment/create")
+def create_index_experiment_index() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+    payload = request.get_json(silent=True) or {}
+    table_name = str(payload.get("table", "performance_records")).strip()
+    index_name = str(payload.get("index_name", "")).strip()
+    columns = [str(col).strip() for col in payload.get("columns", []) if str(col).strip()]
+
+    if table_name not in INDEX_ALLOWED_TABLES:
+        return jsonify({"error": "table is not allowed"}), 400
+    if not valid_identifier(index_name):
+        return jsonify({"error": "invalid index name"}), 400
+    valid_columns = set(table_columns(table_name))
+    if not columns or any(col not in valid_columns for col in columns):
+        return jsonify({"error": "invalid index columns"}), 400
+    if index_name.upper() == "PRIMARY":
+        return jsonify({"error": "cannot create PRIMARY here"}), 400
+
+    column_sql = ", ".join(f"`{col}`" for col in columns)
+    sql = f"CREATE INDEX `{index_name}` ON `{table_name}`({column_sql})"
+    try:
+        execute_write(sql)
+    except pymysql.err.OperationalError as exc:
+        log_user_action(user["user_id"], f"Rejected custom index creation on {table_name}", sql, 0)
+        return jsonify({"error": str(exc)}), 409
+    log_user_action(user["user_id"], f"Created custom index {index_name} on {table_name}", sql, 1)
+    return jsonify({"ok": True, "table": table_name, "index_name": index_name, "columns": columns})
+
+
+@app.post("/api/index_experiment/drop")
+def drop_index_experiment_index() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+    payload = request.get_json(silent=True) or {}
+    table_name = str(payload.get("table", "performance_records")).strip()
+    index_name = str(payload.get("index_name", "")).strip()
+    if table_name not in INDEX_ALLOWED_TABLES:
+        return jsonify({"error": "table is not allowed"}), 400
+    if not valid_identifier(index_name) or index_name.upper() == "PRIMARY":
+        return jsonify({"error": "invalid index name"}), 400
+
+    sql = f"DROP INDEX `{index_name}` ON `{table_name}`"
+    try:
+        execute_write(sql)
+    except pymysql.err.OperationalError as exc:
+        log_user_action(user["user_id"], f"Rejected custom index drop on {table_name}", sql, 0)
+        return jsonify({"error": str(exc)}), 409
+    log_user_action(user["user_id"], f"Dropped custom index {index_name} on {table_name}", sql, 1)
+    return jsonify({"ok": True, "table": table_name, "index_name": index_name})
+
+
+@app.get("/api/index_experiment/run")
+def run_index_experiment() -> Any:
+    reynolds_number = int(request.args.get("reynolds_number", "500000"))
+    sql = """
+        SELECT airfoil_id, version_id, alpha_deg, cl, cd
+        FROM performance_records
+        WHERE reynolds_number = %s
+        ORDER BY alpha_deg
+    """
+    explain_rows = query_all("EXPLAIN " + sql, (reynolds_number,))
+    start = time.perf_counter()
+    rows = query_all(sql, (reynolds_number,))
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    return jsonify(
+        {
+            "reynolds_number": reynolds_number,
+            "elapsed_ms": round(elapsed_ms, 3),
+            "row_count": len(rows),
+            "explain": explain_rows,
+        }
+    )
+
+
+@app.post("/api/index_experiment/run_sql")
+def run_index_experiment_sql() -> Any:
+    user = current_user()
+    if not user:
+        return jsonify({"error": "login required"}), 401
+    payload = request.get_json(silent=True) or {}
+    sql = str(payload.get("sql", "")).strip()
+    normalized = sql.rstrip(";").lstrip().lower()
+    if not normalized.startswith("select") or not is_safe_select(sql):
+        log_user_action(user["user_id"], "Rejected index experiment SQL", sql, 0)
+        return jsonify({"error": "index experiment only accepts one SELECT statement"}), 400
+
+    runnable_sql = sql.rstrip(";")
+    try:
+        explain_rows = query_all("EXPLAIN " + runnable_sql)
+        start = time.perf_counter()
+        rows = query_all(runnable_sql)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+    except pymysql.MySQLError as exc:
+        log_user_action(user["user_id"], "Failed index experiment SQL", sql, 0)
+        return jsonify({"error": str(exc)}), 400
+
+    log_user_action(user["user_id"], "Ran index experiment SQL", sql, 1)
+    return jsonify(
+        {
+            "elapsed_ms": round(elapsed_ms, 3),
+            "row_count": len(rows),
+            "rows": rows[:100],
+            "explain": explain_rows,
+        }
+    )
+
+
+@app.post("/api/transaction_experiment/run")
+def run_transaction_experiment() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    sql_text = str(payload.get("sql", "")).strip()
+    mode = str(payload.get("mode", "rollback")).strip().lower()
+    if mode not in {"commit", "rollback"}:
+        return jsonify({"error": "mode must be commit or rollback"}), 400
+
+    statements = split_sql_statements(sql_text)
+    if not statements:
+        return jsonify({"error": "transaction SQL is empty"}), 400
+    if len(statements) > 20:
+        return jsonify({"error": "at most 20 statements per transaction"}), 400
+    if any(not is_allowed_transaction_sql(statement) for statement in statements):
+        log_user_action(user["user_id"], "Rejected transaction experiment", sql_text, 0)
+        return jsonify({"error": "transaction experiment only allows SELECT/INSERT/UPDATE/DELETE, and cannot touch users/query_logs or DDL"}), 400
+
+    conn = pymysql.connect(**db_config(), autocommit=False)
+    results: list[dict[str, Any]] = []
+    start = time.perf_counter()
+    status = "rolled back"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("START TRANSACTION")
+            for index, statement in enumerate(statements, start=1):
+                statement_start = time.perf_counter()
+                affected = cur.execute(statement)
+                elapsed_ms = (time.perf_counter() - statement_start) * 1000
+                if statement.lstrip().lower().startswith("select "):
+                    rows = list(cur.fetchall())
+                    results.append(
+                        {
+                            "step": index,
+                            "type": "SELECT",
+                            "sql": statement,
+                            "row_count": len(rows),
+                            "affected_rows": None,
+                            "elapsed_ms": round(elapsed_ms, 3),
+                            "rows": rows[:50],
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "step": index,
+                            "type": statement.split(None, 1)[0].upper(),
+                            "sql": statement,
+                            "row_count": 0,
+                            "affected_rows": int(affected),
+                            "elapsed_ms": round(elapsed_ms, 3),
+                            "rows": [],
+                        }
+                    )
+
+        if mode == "commit":
+            conn.commit()
+            status = "committed"
+        else:
+            conn.rollback()
+            status = "rolled back"
+    except pymysql.MySQLError as exc:
+        conn.rollback()
+        elapsed_total = (time.perf_counter() - start) * 1000
+        log_user_action(user["user_id"], "Failed transaction experiment", sql_text, 0, int(elapsed_total))
+        return jsonify({"error": str(exc), "status": "rolled back", "results": results}), 400
+    finally:
+        conn.close()
+
+    elapsed_total = (time.perf_counter() - start) * 1000
+    log_user_action(user["user_id"], f"Transaction experiment {status}", sql_text, 1, int(elapsed_total))
+    return jsonify(
+        {
+            "status": status,
+            "mode": mode,
+            "statement_count": len(statements),
+            "elapsed_ms": round(elapsed_total, 3),
+            "results": results,
+        }
+    )
+
+
+@app.post("/api/transaction_experiment/concurrency")
+def run_concurrency_experiment() -> Any:
+    user = current_user()
+    if not user or not is_manager(user["role"]):
+        return jsonify({"error": "engineer/admin permission required"}), 403
+
+    perf_id = int((request.get_json(silent=True) or {}).get("perf_id", 9100001))
+    setup_sql = """
+        INSERT INTO performance_records
+            (perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+        VALUES
+            (%s, 'ag03', 1, 1.23, 654321, 0.100, 0.010, 0.000, 'generated_synthetic', 0)
+        ON DUPLICATE KEY UPDATE
+            cl = 0.100,
+            cd = 0.010,
+            cm = 0.000,
+            is_anomaly = 0
+    """
+    execute_write(setup_sql, (perf_id,))
+
+    steps: list[dict[str, Any]] = []
+    errors: list[str] = []
+    steps_lock = threading.Lock()
+    start_time = time.perf_counter()
+
+    def add_step(actor: str, event: str, elapsed_ms: float | None = None) -> None:
+        with steps_lock:
+            steps.append(
+                {
+                    "actor": actor,
+                    "event": event,
+                    "elapsed_ms": None if elapsed_ms is None else round(elapsed_ms, 3),
+                    "at_ms": round((time.perf_counter() - start_time) * 1000, 3),
+                }
+            )
+
+    def tx_a() -> None:
+        conn = pymysql.connect(**db_config(), autocommit=False)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET innodb_lock_wait_timeout = 8")
+                cur.execute("START TRANSACTION")
+                add_step("User A", "BEGIN")
+                began = time.perf_counter()
+                cur.execute("UPDATE performance_records SET cl = 0.111 WHERE perf_id = %s", (perf_id,))
+                add_step("User A", "UPDATE cl = 0.111; row lock is held for 2 seconds", (time.perf_counter() - began) * 1000)
+                time.sleep(2)
+                conn.commit()
+                add_step("User A", "COMMIT, row lock released")
+        except pymysql.MySQLError as exc:
+            conn.rollback()
+            errors.append(f"User A: {exc}")
+            add_step("User A", "ROLLBACK after error")
+        finally:
+            conn.close()
+
+    def tx_b() -> None:
+        time.sleep(0.3)
+        conn = pymysql.connect(**db_config(), autocommit=False)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET innodb_lock_wait_timeout = 8")
+                cur.execute("START TRANSACTION")
+                add_step("User B", "BEGIN")
+                began = time.perf_counter()
+                cur.execute("UPDATE performance_records SET cl = 0.222 WHERE perf_id = %s", (perf_id,))
+                add_step("User B", "UPDATE cl = 0.222; waited for User A row lock", (time.perf_counter() - began) * 1000)
+                conn.commit()
+                add_step("User B", "COMMIT")
+        except pymysql.MySQLError as exc:
+            conn.rollback()
+            errors.append(f"User B: {exc}")
+            add_step("User B", "ROLLBACK after error")
+        finally:
+            conn.close()
+
+    thread_a = threading.Thread(target=tx_a)
+    thread_b = threading.Thread(target=tx_b)
+    thread_a.start()
+    thread_b.start()
+    thread_a.join()
+    thread_b.join()
+    elapsed_ms = (time.perf_counter() - start_time) * 1000
+
+    final_rows = query_all(
+        """
+        SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm
+        FROM performance_records
+        WHERE perf_id = %s
+        """,
+        (perf_id,),
+    )
+    is_valid = 0 if errors else 1
+    log_user_action(
+        user["user_id"],
+        "Concurrency experiment: two users update one performance record",
+        f"User A and User B update performance_records.perf_id = {perf_id}",
+        is_valid,
+        int(elapsed_ms),
+    )
+    return jsonify(
+        {
+            "perf_id": perf_id,
+            "status": "failed" if errors else "completed",
+            "elapsed_ms": round(elapsed_ms, 3),
+            "steps": steps,
+            "errors": errors,
+            "final_rows": final_rows,
+        }
+    )
+
+
+INDEX_HTML = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Airfoil Database</title>
+  <style>
+    :root { --bg:#f7f8fb; --panel:#fff; --line:#d8dde8; --ink:#172033; --muted:#62708a; --accent:#1f766f; --danger:#b42318; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:"Segoe UI",Arial,"Microsoft YaHei",sans-serif; font-size:14px; color:var(--ink); background:var(--bg); }
+    .authGate { position:fixed; inset:0; z-index:1000; min-height:100vh; display:grid; place-items:start center; padding:24px; overflow:auto; background:linear-gradient(180deg,#f7f8fb,#eef3f5); }
+    .authCard { width:min(460px,100%); background:#fff; border:1px solid var(--line); border-radius:10px; padding:22px; box-shadow:0 16px 36px rgba(26,34,55,.12); display:grid; gap:12px; }
+    .authCard h1 { font-size:24px; }
+    .authActions { display:flex; gap:8px; flex-wrap:wrap; }
+    .app { height:100vh; min-height:0; display:none; grid-template-columns:300px minmax(0,1fr); overflow:hidden; }
+    .app.visible { display:grid; }
+    .app.noAside { grid-template-columns:minmax(0,1fr); }
+    .app.noAside aside { display:none; }
+    aside { height:100vh; min-height:0; border-right:1px solid var(--line); background:#fcfdff; padding:18px; display:grid; grid-template-rows:auto auto minmax(0,1fr); gap:14px; overflow:hidden; }
+    main { height:100vh; min-width:0; min-height:0; padding:18px; display:block; overflow-y:auto; overflow-x:hidden; }
+    h1 { margin:0; font-size:23px; } h2 { margin:0 0 10px; font-size:17px; }
+    .sub,.status { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+    input,select,textarea { border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); padding:9px 11px; outline:none; min-width:0; font-size:14px; }
+    textarea { min-height:78px; resize:vertical; font-family:Consolas,monospace; font-size:13px; line-height:1.45; }
+    button.action { min-height:36px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); padding:0 12px; cursor:pointer; font-size:14px; }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .search { width:100%; height:36px; }
+    .list { min-height:0; overflow-y:auto; overflow-x:hidden; border:1px solid var(--line); background:var(--panel); border-radius:8px; }
+    .item { width:100%; min-height:54px; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; border:0; border-bottom:1px solid var(--line); background:transparent; padding:10px 12px; text-align:left; cursor:pointer; color:var(--ink); }
+    .item:hover,.item.active { background:#eef7f6; }
+    .item strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; }
+    .item span { color:var(--muted); font-size:13px; }
+    .badge { align-self:start; border-radius:999px; background:#edf0f6; padding:3px 8px; font-size:12px; color:var(--muted); }
+    .panel,.titlebar,.versionBox,section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; box-shadow:0 8px 22px rgba(26,34,55,.08); }
+    .panel { display:grid; gap:10px; }
+    .pageTabs { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:14px; }
+    .pageTabs .userMenu { margin-left:auto; }
+    .tabBtn { min-height:38px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); padding:0 14px; cursor:pointer; font-size:14px; line-height:1; display:inline-flex; align-items:center; justify-content:center; }
+    .tabBtn.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .page { min-height:0; display:none; gap:14px; align-content:start; }
+    .page.active { display:grid; }
+    .splitPage { grid-template-columns:minmax(360px,.9fr) minmax(460px,1.1fr); align-items:start; }
+    #pageIndex.splitPage { grid-template-columns:1fr; }
+    .toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; margin-bottom:10px; }
+    .userMenu { display:none; align-items:center; justify-content:flex-end; gap:10px; min-width:0; }
+    .userMenu .status { white-space:nowrap; }
+    .top { display:grid; grid-template-columns:minmax(0,1fr) minmax(260px,320px); gap:12px; align-items:stretch; }
+    .titlebar { display:flex; flex-direction:column; justify-content:center; min-height:78px; }
+    .versionBox { display:grid; grid-template-columns:auto minmax(190px,1fr); gap:10px; align-items:center; min-height:78px; }
+    .versionBox h2 { margin:0; }
+    .versionBox select { width:100%; }
+    .formRow { display:grid; grid-template-columns:160px 160px auto; gap:8px; align-items:center; }
+    .sqlRow { display:grid; grid-template-columns:minmax(220px,260px) minmax(0,1fr) auto; gap:10px; align-items:start; }
+    .adminPanel,.editorPanel,.transactionPanel,.dbObjectPanel,.batchPanel,.governancePanel { display:none; border-top:1px solid var(--line); padding-top:10px; gap:8px; }
+    .adminPanel.visible,.editorPanel.visible,.transactionPanel.visible,.dbObjectPanel.visible,.batchPanel.visible,.governancePanel.visible { display:grid; }
+    .createRow { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)) auto; gap:8px; align-items:center; }
+    .grid { min-height:0; display:grid; grid-template-columns:repeat(2,minmax(360px,1fr)); grid-auto-rows:auto; gap:14px; }
+    section { min-height:0; overflow:hidden; display:grid; grid-template-rows:auto minmax(0,1fr); }
+    .chartSection { position:relative; height:300px; }
+    .chartTooltip { position:absolute; display:none; pointer-events:none; z-index:5; max-width:260px; border:1px solid var(--line); border-radius:6px; background:#fff; box-shadow:0 10px 24px rgba(26,34,55,.16); padding:8px 10px; font-family:Consolas,monospace; font-size:13px; line-height:1.45; color:var(--ink); }
+    .versionInfoSection { grid-column:1 / -1; }
+    .anomalySection { grid-column:1 / -1; min-height:260px; }
+    .wideChartSection { grid-column:1 / -1; height:380px; }
+    canvas { width:100%; height:100%; border:1px solid var(--line); border-radius:6px; background:#fff; }
+    .metrics { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); grid-auto-rows:72px; gap:8px; align-content:start; }
+    .metric { border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:#fbfcff; display:flex; flex-direction:column; justify-content:center; }
+    .metric b { font-size:20px; }
+    .metric span { color:var(--muted); font-size:13px; }
+    .versionContent { min-height:0; overflow:auto; display:grid; align-content:start; gap:12px; }
+    .experiment { border-top:1px solid var(--line); padding-top:12px; display:grid; gap:10px; }
+    .page > .experiment { border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:14px; box-shadow:0 8px 22px rgba(26,34,55,.08); }
+    .indexSqlPanel { min-height:0; display:grid; grid-template-rows:auto auto auto minmax(0,1fr); gap:10px; }
+    .experimentControls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .iconAction { min-width:42px; font-size:22px; font-weight:700; line-height:1; }
+    .iconAction.dangerIcon { color:var(--danger); }
+    .rowDeleteBtn { min-width:30px; min-height:28px; padding:0 8px; color:var(--danger); font-weight:700; }
+    .indexForm { display:none; gap:8px; border:1px solid var(--line); border-radius:6px; background:#fbfcff; padding:10px; }
+    .indexForm.visible { display:grid; }
+    .compactIndexForm.visible { grid-template-columns:minmax(220px,320px) minmax(0,1fr) auto; align-items:start; }
+    .compactIndexForm .status { grid-column:1 / -1; margin:0; }
+    .compactIndexForm .indexColumnBox { max-height:74px; }
+    #indexList { max-height:420px; min-height:260px; }
+    .indexColumnBox { max-height:120px; overflow:auto; border:1px solid var(--line); border-radius:6px; background:#fff; padding:8px; }
+    .keyFilterBox { max-height:none; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+    .keyFilter { display:grid; gap:5px; align-content:start; }
+    .keyFilter span { font-size:13px; color:var(--muted); }
+    .keyFilter select { width:100%; }
+    .inlineEditCell { background:#fbfcff; padding:12px 14px; white-space:normal; }
+    .inlineEditBox { display:grid; gap:10px; min-width:720px; }
+    .inlineEditGrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px; }
+    .inlineEditGrid label { display:grid; gap:5px; color:var(--muted); font-size:13px; }
+    .inlineEditGrid input,.inlineEditGrid select,.inlineEditGrid textarea { width:100%; }
+    .inlineEditGrid textarea { min-height:72px; resize:vertical; grid-column:1 / -1; }
+    .inlineEditActions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .indexSqlArea { width:100%; min-height:150px; }
+    .transactionArea { width:100%; min-height:120px; }
+    .box { max-height:260px; overflow:auto; border:1px solid var(--line); border-radius:6px; background:#fbfcff; padding:10px; font-family:Consolas,monospace; font-size:13px; line-height:1.45; white-space:normal; }
+    .box h2 { margin:8px 0 6px; font-size:15px; }
+    #adminResult { max-height:calc(100vh - 220px); min-height:360px; }
+    #governanceResult { max-height:none; height:calc(100vh - 260px); min-height:360px; overflow:auto; }
+    #mainTableResult { max-height:none; min-height:360px; overflow:auto; }
+    #governanceResult .tableWrap,#mainTableResult .tableWrap { max-height:calc(100vh - 350px); overflow:auto; padding-bottom:8px; }
+    .tableWrap { overflow:auto; border:1px solid var(--line); border-radius:6px; max-width:100%; padding-bottom:6px; }
+    table { width:100%; min-width:max-content; border-collapse:collapse; font-size:13px; background:#fff; }
+    th,td { border-bottom:1px solid var(--line); padding:9px 10px; text-align:left; white-space:nowrap; }
+    th { position:sticky; top:0; background:#f3f5f9; z-index:1; }
+    .rowActions { display:flex; gap:6px; align-items:center; }
+    .rowActions .rowDeleteBtn { color:var(--danger); border-color:#f0b8b3; }
+    .danger { color:var(--danger); font-weight:600; }
+    @media (max-width:980px){ .app{grid-template-columns:1fr;} aside{min-height:360px;border-right:0;border-bottom:1px solid var(--line);} .grid,.splitPage{grid-template-columns:1fr;grid-template-rows:auto;} .top,.formRow,.sqlRow,.createRow{grid-template-columns:1fr;} .userMenu{justify-content:flex-start; flex-wrap:wrap;} .metrics{grid-template-columns:repeat(2,minmax(0,1fr));} }
+  </style>
+</head>
+<body>
+<div class="authGate" id="authGate">
+  <div class="authCard">
+    <div>
+      <h1>翼型数据库系统</h1>
+      <div class="sub">登录后进入数据库界面；公开注册仅创建只读用户。</div>
+    </div>
+    <input id="gateName" placeholder="username">
+    <input id="gatePassword" type="password" placeholder="password">
+    <div class="authActions">
+      <button class="action primary" id="gateLoginBtn" onclick="gateLogin()">登录</button>
+      <button class="action" id="gateRegisterBtn" onclick="gateRegisterViewer()">注册只读用户</button>
+    </div>
+    <div class="box" id="gateMessage">管理员账号由服务器预先创建。</div>
+  </div>
+</div>
+<div class="app" id="appShell">
+  <aside>
+    <div><h1>翼型数据库</h1><div class="sub" id="summary">读取数据库中</div></div>
+    <input class="search" id="search" placeholder="搜索 airfoil_id 或名称">
+    <div class="list" id="airfoilList"></div>
+  </aside>
+  <main>
+    <div class="pageTabs">
+      <button class="tabBtn active" data-tab="overview">翼型总览</button>
+      <button class="tabBtn" data-tab="sql">SQL 查询</button>
+      <button class="tabBtn" data-tab="index">索引实验</button>
+      <button class="tabBtn" data-tab="transaction">事务实验</button>
+      <button class="tabBtn" data-tab="dbobjects">数据库对象实验</button>
+      <button class="tabBtn" data-tab="governance">主数据表</button>
+      <button class="tabBtn" data-tab="admin">管理与日志</button>
+      <button class="tabBtn" data-tab="batch">批量导入</button>
+    </div>
+    <div class="page active fullPage" id="pageOverview"></div>
+    <div class="page fullPage" id="pageSql"></div>
+    <div class="page splitPage" id="pageIndex"></div>
+    <div class="page fullPage" id="pageTransaction"></div>
+    <div class="page fullPage" id="pageDbObjects"></div>
+    <div class="page fullPage" id="pageBatch"></div>
+    <div class="page fullPage" id="pageGovernance"></div>
+    <div class="page fullPage" id="pageAdmin"></div>
+    <div class="panel">
+      <div class="toolbar">
+        <h2>User & QueryLog</h2>
+        <div class="userMenu" id="loggedInBar">
+          <div class="status" id="userStatus">Not logged in</div>
+        <button class="action" id="logoutBtn">退出</button>
+        </div>
+      </div>
+      <div class="sqlRow">
+        <div class="status" id="permissionHint">Login to query</div>
+
+        <textarea id="sqlInput">SELECT airfoil_id, name, final_point_count FROM airfoils LIMIT 10</textarea>
+        <button class="action primary" id="runSqlBtn">执行 SQL</button>
+      </div>
+      <div class="box" id="sqlResult">查询结果和操作日志会显示在这里。</div>
+      <div class="adminPanel" id="adminPanel">
+        <div class="toolbar">
+          <h2>管理者审计区</h2>
+          <div class="experimentControls">
+            <select id="adminAuditTargetSelect">
+              <option value="data_sources">data_sources</option>
+              <option value="airfoils" selected>airfoils</option>
+              <option value="data_versions">data_versions</option>
+              <option value="coordinate_points">coordinate_points</option>
+              <option value="performance_records">performance_records</option>
+              <option value="anomaly_records">anomaly_records</option>
+            </select>
+            <button class="action" id="loadUsersBtn">查看 users</button>
+            <button class="action" id="loadLogsBtn">查看 query_logs</button>
+            <button class="action adminTraceBtn" data-table="data_record_lineage">记录修改追溯</button>
+            <button class="action adminTraceBtn" data-table="data_import_records">来源/版本写入记录</button>
+            <button class="action adminTraceBtn" data-table="audit_logs">审计日志</button>
+            <button class="action adminTraceBtn" data-table="soft_delete_records">逻辑删除记录</button>
+            <select id="adminTableSelect">
+              <option value="data_sources">data_sources</option>
+              <option value="airfoils" selected>airfoils</option>
+              <option value="data_versions">data_versions</option>
+              <option value="coordinate_points">coordinate_points</option>
+              <option value="performance_records">performance_records</option>
+              <option value="anomaly_records">anomaly_records</option>
+            </select>
+            <select id="adminLimitSelect">
+              <option value="100">100 rows</option>
+              <option value="500">500 rows</option>
+              <option value="all">全部</option>
+            </select>
+            <button class="action" id="loadMainTableBtn">查看主表</button>
+          </div>
+        </div>
+        <div class="box" id="adminResult">engineer/admin 可查看 users、query_logs 与主数据表。</div>
+        <div class="createRow" id="adminCreateUserRow">
+          <input id="adminNewUsername" placeholder="new username">
+          <input id="adminNewPassword" type="password" placeholder="new password">
+          <select id="adminNewRole">
+            <option value="viewer">viewer</option>
+            <option value="analyst">analyst</option>
+            <option value="engineer">engineer</option>
+            <option value="admin">admin</option>
+          </select>
+          <span class="status">admin only</span>
+          <span></span>
+          <button class="action primary" id="adminCreateUserBtn">创建 User</button>
+        </div>
+      </div>
+      <div class="editorPanel" id="editorPanel">
+        <div class="toolbar"><h2>图形化创建翼型</h2><div class="status">engineer/admin 可用</div></div>
+        <div class="createRow">
+          <input id="newAirfoilId" placeholder="airfoil_id">
+          <input id="newAirfoilName" placeholder="name">
+          <input id="newAirfoilFamily" placeholder="family" value="Manual">
+          <input id="newAirfoilPoints" placeholder="point count" value="1">
+          <span></span>
+          <button class="action primary" id="createAirfoilBtn">创建 Airfoil</button>
+        </div>
+        <div class="toolbar"><h2>翼型基本信息修改</h2><div class="status">从 airfoils 查询结果点击“编辑”后自动填入</div></div>
+        <div class="createRow">
+          <input id="editAirfoilId" placeholder="airfoil_id">
+          <input id="editAirfoilName" placeholder="name">
+          <input id="editAirfoilSource" placeholder="source">
+          <input id="editAirfoilFamily" placeholder="family">
+          <select id="editAirfoilGenerated"><option value="0">real</option><option value="1">generated</option></select>
+          <button class="action primary" id="updateAirfoilBtn">更新 Airfoil</button>
+        </div>
+        <div class="createRow">
+          <select id="editAirfoilSourceType">
+            <option value="uiuc_raw">uiuc_raw</option>
+            <option value="uiuc_raw_with_tracked_augmentation">uiuc_raw_with_tracked_augmentation</option>
+            <option value="generated_synthetic">generated_synthetic</option>
+            <option value="injected_anomaly">injected_anomaly</option>
+          </select>
+          <input id="editAirfoilSourceFile" placeholder="source_file">
+          <select id="editAirfoilAugmented"><option value="0">real only</option><option value="1">augmented</option></select>
+          <input id="editAirfoilOriginalPoints" placeholder="original_point_count">
+          <input id="editAirfoilFinalPoints" placeholder="final_point_count">
+          <span></span>
+        </div>
+        <div class="toolbar"><h2>性能记录修改</h2><div class="status">engineer/admin 可用，UPDATE 会触发审计日志</div></div>
+        <div class="createRow">
+          <input id="editPerfId" placeholder="perf_id">
+          <input id="editCl" placeholder="cl">
+          <input id="editCd" placeholder="cd">
+          <input id="editCm" placeholder="cm">
+          <select id="editIsAnomaly"><option value="0">normal</option><option value="1">anomaly</option></select>
+          <button class="action primary" id="updatePerformanceBtn">更新 Performance</button>
+        </div>
+        <div class="toolbar"><h2>异常记录修改</h2><div class="status">从 anomaly_records 查询结果点击“编辑”后自动填入</div></div>
+        <div class="createRow">
+          <input id="editAnomalyId" placeholder="anomaly_id">
+          <input id="editAnomalyPerfId" placeholder="perf_id">
+          <input id="editAnomalyAirfoilId" placeholder="airfoil_id">
+          <input id="editAnomalyVersionId" placeholder="version_id">
+          <select id="editAnomalyRuleType">
+            <option value="negative_cd">negative_cd</option>
+            <option value="extreme_cl">extreme_cl</option>
+            <option value="extreme_ld_ratio">extreme_ld_ratio</option>
+          </select>
+          <button class="action primary" id="updateAnomalyBtn">更新 Anomaly</button>
+        </div>
+        <textarea id="editAnomalyDetail" placeholder="detail"></textarea>
+      </div>
+      <div class="governancePanel" id="governancePanel">
+        <div class="toolbar" id="governanceExperimentHeader">
+          <h2>数据治理</h2>
+          <div class="status">异常规则 / 版本追踪 / 来源说明 / 删除策略</div>
+        </div>
+        <div class="experimentControls" id="governanceExperimentButtons">
+          <button class="action primary" id="mainTableModeBtn">主数据表查看</button>
+          <button class="action governanceBtn" data-scenario="anomaly">异常规则检测</button>
+          <button class="action governanceBtn" data-scenario="version">版本追踪</button>
+          <button class="action governanceBtn" data-scenario="source">数据来源说明</button>
+          <button class="action governanceBtn" data-scenario="delete">删除策略说明</button>
+        </div>
+        <div id="mainTableSection">
+          <div class="toolbar">
+            <h2>主数据表查看</h2>
+            <div class="experimentControls" id="governanceTableControls"></div>
+          </div>
+          <div class="indexColumnBox keyFilterBox" id="mainTableFilterBox"></div>
+          <div class="box" id="mainTableResult">请选择关系并查看主表。</div>
+          <div class="experimentControls" id="mainAddControls">
+            <button class="action" id="toggleMainAddBtn">+ 添加记录</button>
+          </div>
+          <div class="indexColumnBox keyFilterBox" id="mainAddBox" style="display:none"></div>
+        </div>
+        <div class="box" id="governanceResult" style="display:none">点击上方按钮查看数据治理证据。</div>
+      </div>
+      <div class="transactionPanel" id="transactionPanel">
+        <div class="toolbar">
+          <h2>事务实验</h2>
+          <div class="status">同一连接内 BEGIN / COMMIT / ROLLBACK</div>
+        </div>
+        <div class="status">
+          这里允许多条 SELECT / INSERT / UPDATE / DELETE；DDL 和 users/query_logs 不参与事务实验。
+        </div>
+        <div class="experimentControls">
+          <button class="action" id="concurrencyScenarioBtn">场景1：并发修改同一性能记录</button>
+          <button class="action" id="bulkImportScenarioBtn">场景2：批量导入失败回滚</button>
+          <button class="action" id="versionScenarioBtn">场景3：主表与版本表同时失败</button>
+        </div>
+        <div class="experimentControls">
+          <input id="savedTransactionTitle" placeholder="transaction title">
+          <button class="action" id="saveTransactionBtn">保存当前事务</button>
+          <select id="savedTransactionSelect"></select>
+          <button class="action" id="loadSavedTransactionBtn">载入</button>
+          <button class="action" id="deleteSavedTransactionBtn">删除</button>
+        </div>
+        <textarea class="transactionArea" id="transactionSqlInput">UPDATE airfoils
+SET family = 'Transaction Test'
+WHERE airfoil_id = 'ag03';
+
+SELECT airfoil_id, name, family
+FROM airfoils
+WHERE airfoil_id = 'ag03';</textarea>
+        <div class="experimentControls">
+          <button class="action primary" id="rollbackTransactionBtn">执行并回滚</button>
+          <button class="action" id="commitTransactionBtn">执行并提交</button>
+        </div>
+        <div class="box" id="transactionResult">事务实验结果会显示在这里。</div>
+      </div>
+      <div class="dbObjectPanel" id="dbObjectPanel">
+        <div class="toolbar">
+          <h2>数据库对象实验</h2>
+          <div class="status">触发器 / 视图 / 存储过程</div>
+        </div>
+        <div class="status">
+          点击按钮后由后端执行固定实验 SQL，并把结果表直接显示在页面中。
+        </div>
+        <div class="experimentControls">
+          <button class="action primary dbObjectBtn" data-scenario="views">视图查询</button>
+          <button class="action dbObjectBtn" data-scenario="trigger_reject">触发器拒绝非法异常</button>
+          <button class="action dbObjectBtn" data-scenario="trigger_audit">触发器自动审计</button>
+          <button class="action dbObjectBtn" data-scenario="proc_summary">存储过程统计分析</button>
+          <button class="action dbObjectBtn" data-scenario="proc_import_bad">非法批量导入</button>
+          <button class="action dbObjectBtn" data-scenario="proc_import_good">合法批量导入</button>
+        </div>
+        <div class="box" id="dbObjectResult">数据库对象实验结果会显示在这里。</div>
+      </div>
+      <div class="batchPanel" id="batchPanel">
+        <div class="toolbar"><h2>自定义批量导入</h2><div class="status">选择关系后导入 CSV/TSV；文件表头必须与该关系属性顺序完全一致</div></div>
+        <div class="experimentControls">
+          <select id="batchImportTarget">
+            <option value="performance_records">performance_records</option>
+            <option value="airfoils">airfoils</option>
+            <option value="data_versions">data_versions</option>
+            <option value="coordinate_points">coordinate_points</option>
+            <option value="anomaly_records">anomaly_records</option>
+            <option value="data_sources">data_sources</option>
+          </select>
+          <input id="batchImportId" placeholder="batch_id" value="ui_batch_001">
+          <input id="batchImportFile" type="file" accept=".csv,.tsv,.txt">
+          <button class="action" id="loadGoodBatchBtn">载入合法样例</button>
+          <button class="action" id="loadBadBatchBtn">载入非法样例</button>
+          <button class="action primary" id="runBatchImportBtn">导入批次</button>
+        </div>
+        <div class="box" id="batchExpectedHeader">请选择关系后查看期望表头。</div>
+        <textarea class="transactionArea" id="batchImportInput">perf_id,airfoil_id,version_id,alpha_deg,reynolds_number,cl,cd,cm,source_type,is_anomaly
+9910001,ag03,1,-2,123458,0.42,0.012,0.0,generated_synthetic,0
+9910002,ag03,1,2,123458,0.62,0.014,0.0,generated_synthetic,0</textarea>
+        <div class="box" id="batchImportResult">批量导入结果会显示在这里。</div>
+      </div>
+      </div>
+
+    <div class="top">
+      <div class="titlebar"><h1 id="airfoilTitle">选择一个翼型</h1><div class="sub" id="airfoilMeta">坐标、性能和异常记录会显示在这里</div></div>
+      <div class="versionBox"><h2>版本</h2><select id="versionSelect"></select></div>
+    </div>
+    <div class="grid">
+      <section class="chartSection"><div class="toolbar"><h2>二维轮廓</h2><div class="status" id="coordStatus">-</div></div><canvas id="shapeCanvas"></canvas><div class="chartTooltip" id="shapeTooltip"></div></section>
+      <section class="chartSection"><div class="toolbar"><h2>CL-alpha 曲线</h2><select id="reSelect"></select></div><canvas id="perfCanvas"></canvas><div class="chartTooltip" id="perfTooltip"></div></section>
+      <section class="chartSection"><div class="toolbar"><h2>CD-alpha 曲线</h2><select id="cdReSelect"></select></div><canvas id="cdCanvas"></canvas><div class="chartTooltip" id="cdTooltip"></div></section>
+      <section class="chartSection"><div class="toolbar"><h2>CL/CD-alpha 曲线</h2><select id="ldReSelect"></select></div><canvas id="ldCanvas"></canvas><div class="chartTooltip" id="ldTooltip"></div></section>
+      <section class="chartSection wideChartSection"><div class="toolbar"><h2>同一 Re 下多翼型性能对比</h2><div class="experimentControls"><select id="compareReSelect"><option value="50000">Re 50,000</option><option value="100000">Re 100,000</option><option value="200000">Re 200,000</option><option value="500000">Re 500,000</option></select><button class="action primary compareMetricBtn" data-metric="max_cl">最大 CL</button><button class="action compareMetricBtn" data-metric="min_cd">最小 CD</button><button class="action compareMetricBtn" data-metric="max_ld">最大 CL/CD</button><button class="action compareMetricBtn" data-metric="avg_cl">平均 CL</button></div></div><canvas id="compareCanvas"></canvas><div class="chartTooltip" id="compareTooltip"></div></section>
+      <section class="chartSection wideChartSection"><div class="toolbar"><h2>不同版本翼型性能差异图</h2><div class="status" id="versionDiffStatus">当前翼型版本对比</div></div><canvas id="versionDiffCanvas"></canvas><div class="chartTooltip" id="versionDiffTooltip"></div></section>
+      <section class="versionInfoSection">
+        <div class="toolbar"><h2>版本信息</h2><div class="status" id="perfStatus">-</div></div>
+        <div class="versionContent">
+          <div class="metrics" id="metrics"></div>
+          <div class="experiment">
+            <div class="toolbar"><h2>索引实验</h2><div class="status" id="indexStatus">-</div></div>
+            <div class="status">选择关系后查看该关系上的索引；点 + 新增索引，点每行 × 删除对应索引。</div>
+            <div class="experimentControls">
+              <select id="indexTableSelect"></select>
+              <button class="action" id="loadIndexesBtn">查看当前索引</button>
+            </div>
+            <div class="box" id="indexList">点击“查看当前索引”显示所选表上的索引。</div>
+            <div class="experimentControls">
+              <button class="action iconAction primary" id="showCreateIndexBtn" title="添加索引">+</button>
+            </div>
+            <div class="indexForm compactIndexForm" id="indexForm">
+              <div class="status" id="indexFormHint">选择表和属性，输入索引名后创建索引。</div>
+              <input id="indexNameInput" placeholder="index name, e.g. idx_perf_re_alpha">
+              <div class="indexColumnBox" id="indexColumnBox"></div>
+              <div class="experimentControls">
+                <button class="action primary" id="createIndexBtn">保存新增索引</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section>
+        <div class="toolbar"><h2>索引实验 SQL</h2><div class="status">SELECT only</div></div>
+        <div class="indexSqlPanel">
+          <div class="status">在这里自己编写查询；运行后显示结果表、EXPLAIN 和耗时。</div>
+          <textarea class="indexSqlArea" id="indexSqlInput">SELECT airfoil_id, version_id, alpha_deg, cl, cd
+FROM performance_records
+WHERE reynolds_number = 500000
+ORDER BY alpha_deg</textarea>
+          <div class="experimentControls">
+            <button class="action primary" id="runIndexBtn">运行实验 SQL</button>
+          </div>
+          <div class="box" id="indexResult">等待运行</div>
+        </div>
+      </section>
+    </div>
+    <section>
+      <div class="toolbar"><h2>异常记录</h2><div class="status" id="anomalyStatus">-</div></div>
+      <div class="tableWrap"><table><thead><tr><th>ID</th><th>规则</th><th>alpha</th><th>Re</th><th>CL</th><th>CD</th></tr></thead><tbody id="anomalyRows"></tbody></table></div>
+    </section>
+  </main>
+</div>
+<script>
+const state={airfoils:[],selectedAirfoil:null,selectedVersion:1,versions:[],selectedRe:50000,compareMetric:"max_cl",coordinates:[],performance:[],anomalies:[],currentUser:null,savedTransactions:[],shapeScreen:[],perfScreen:[],cdScreen:[],ldScreen:[],compareScreen:[],versionDiffScreen:[],appDataLoaded:false,mainFilterCache:{},secondaryChartTimer:null};
+const $=id=>document.getElementById(id);
+function on(id,event,handler){const el=$(id); if(el&&!el.dataset[`bound${event}`]){el.addEventListener(event,handler);el.dataset[`bound${event}`]="1";}}
+const DEFAULT_TRANSACTION_SQL=`UPDATE airfoils
+SET family = 'Transaction Test'
+WHERE airfoil_id = 'ag03';
+
+SELECT airfoil_id, name, family
+FROM airfoils
+WHERE airfoil_id = 'ag03';`;
+async function getJson(url){const r=await fetch(url); if(!r.ok) throw new Error(await r.text()); return await r.json();}
+async function postJson(url,body={}){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); const data=await r.json(); if(!r.ok) throw data; return data;}
+function num(v,d=4){const n=Number(v); return Number.isFinite(n)?n.toFixed(d):"-";}
+function isManager(){const u=state.currentUser; return u&&(u.role==="engineer"||u.role==="admin");}
+function isAdmin(){return state.currentUser&&state.currentUser.role==="admin";}
+function canUseMainData(){const u=state.currentUser; return u&&(u.role==="analyst"||u.role==="engineer"||u.role==="admin");}
+function escapeHtml(value){return String(value??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));}
+function rowsToTable(rows,options={}){
+  if(!rows||!rows.length)return "<div class='status'>No rows</div>";
+  const cols=Object.keys(rows[0]);
+  const editableTable=isManager()&&["data_sources","airfoils","data_versions","coordinate_points","performance_records","anomaly_records"].includes(options.table);
+  const restorableTable=isAdmin()&&options.table==="soft_delete_records";
+  const actionCell=r=>{
+    if(editableTable){
+      const payload=escapeHtml(JSON.stringify(r));
+      return `<td><div class="rowActions"><button class="action rowEditBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">编辑</button><button class="action rowDeleteBtn mainRowDeleteBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">删除</button></div></td>`;
+    }
+    if(restorableTable){
+      const active=String(r.is_active??"0")==="1";
+      return `<td><div class="rowActions">${active?`<button class="action restoreDeleteBtn" data-delete-id="${escapeHtml(r.delete_id)}" data-table="${escapeHtml(r.table_name||"")}" data-record-pk="${escapeHtml(r.record_pk||"")}">恢复</button>`:`<span class="status">已恢复</span>`}</div></td>`;
+    }
+    return "";
+  };
+  const cell=(r,c)=>{
+    if(c==="sql_text"&&r.log_id){
+      const text=String(r[c]??"");
+      const brief=text.length>90?`${text.slice(0,90)}...`:text;
+      return `<td><a href="/query_logs/${encodeURIComponent(r.log_id)}/sql" target="_blank" rel="noopener">查看全文</a><br><span class="status">${escapeHtml(brief)}</span></td>`;
+    }
+    return `<td>${escapeHtml(r[c])}</td>`;
+  };
+  const actionHead=(editableTable||restorableTable)?"<th>操作</th>":"";
+  return `<div class="tableWrap"><table><thead><tr>${actionHead}${cols.map(c=>`<th>${escapeHtml(c)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${actionCell(r)}${cols.map(c=>cell(r,c)).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+function showSqlResult(target,data){
+  const meta=`<h2>执行性能</h2><div class="status">Rows: ${data.row_count} · Time: ${data.elapsed_ms} ms${data.affected_rows==null?"":` · Affected: ${data.affected_rows}`}</div>`;
+  const explain=data.explain&&data.explain.length?`<h2>EXPLAIN</h2>${rowsToTable(data.explain)}`:"";
+  target.innerHTML=`${meta}${explain}<h2>Result</h2>${rowsToTable(data.rows)}`;
+}
+function resetTransactionEditor(){
+  if($("savedTransactionTitle"))$("savedTransactionTitle").value="";
+  if($("savedTransactionSelect"))$("savedTransactionSelect").value="";
+  if($("transactionSqlInput"))$("transactionSqlInput").value=DEFAULT_TRANSACTION_SQL;
+  if($("transactionResult"))$("transactionResult").textContent="事务实验结果会显示在这里。";
+}
+function setupPages(){
+  const panel=document.querySelector("main > .panel");
+  const top=document.querySelector("main > .top");
+  const grid=document.querySelector("main > .grid");
+  const anomaly=document.querySelector("main > section:last-of-type");
+  const indexExperiment=$("indexStatus").closest(".experiment");
+  const indexSqlSection=$("indexSqlInput").closest("section");
+  document.querySelector(".pageTabs").appendChild($("loggedInBar"));
+  $("pageSql").appendChild(panel);
+  $("pageIndex").appendChild(indexExperiment);
+  $("pageIndex").appendChild(indexSqlSection);
+  $("pageTransaction").appendChild($("transactionPanel"));
+  $("pageDbObjects").appendChild($("dbObjectPanel"));
+  $("pageBatch").appendChild($("batchPanel"));
+  $("pageGovernance").appendChild($("governancePanel"));
+  $("governanceTableControls").appendChild($("adminTableSelect"));
+  $("governanceTableControls").appendChild($("adminLimitSelect"));
+  $("governanceTableControls").appendChild($("loadMainTableBtn"));
+  $("pageGovernance").appendChild($("editorPanel"));
+  $("pageAdmin").appendChild($("adminPanel"));
+  $("pageOverview").appendChild(top);
+  $("pageOverview").appendChild(grid);
+  $("pageOverview").appendChild(anomaly);
+  document.querySelectorAll(".tabBtn").forEach(btn=>{
+    btn.addEventListener("click",()=>showPage(btn.dataset.tab));
+  });
+}
+function showPage(name){
+  document.querySelectorAll(".tabBtn").forEach(btn=>btn.classList.toggle("active",btn.dataset.tab===name));
+  const ids={overview:"pageOverview",sql:"pageSql",index:"pageIndex",transaction:"pageTransaction",dbobjects:"pageDbObjects",batch:"pageBatch",governance:"pageGovernance",admin:"pageAdmin"};
+  Object.entries(ids).forEach(([key,id])=>$(id).classList.toggle("active",key===name));
+  $("appShell").classList.toggle("noAside",name!=="overview");
+  hideTooltip("shapeTooltip");hideTooltip("perfTooltip");
+  if(name==="governance")showMainTableSection(true);
+  if(name==="overview")setTimeout(()=>{drawShape();drawPerformance();drawCd();drawLd();scheduleSecondaryCharts();},0);
+}
+async function init(){
+  on("logoutBtn","click",logout);
+  setupPages();
+  $("search").addEventListener("input",renderAirfoilList);
+  $("versionSelect").addEventListener("change",e=>{state.selectedVersion=Number(e.target.value);loadVersionData();});
+  ["reSelect","cdReSelect","ldReSelect"].forEach(id=>$(id).addEventListener("change",e=>changeSelectedRe(e.target.value)));
+  $("compareReSelect").addEventListener("change",drawCompare);
+  document.querySelectorAll(".compareMetricBtn").forEach(btn=>btn.addEventListener("click",()=>{state.compareMetric=btn.dataset.metric;document.querySelectorAll(".compareMetricBtn").forEach(b=>b.classList.toggle("primary",b===btn));drawCompare();}));
+  $("shapeCanvas").addEventListener("mousemove",handleShapeHover);
+  $("shapeCanvas").addEventListener("mouseleave",()=>hideTooltip("shapeTooltip"));
+  $("perfCanvas").addEventListener("mousemove",handlePerfHover);
+  $("perfCanvas").addEventListener("mouseleave",()=>hideTooltip("perfTooltip"));
+  $("cdCanvas").addEventListener("mousemove",e=>handleSeriesHover(e,"cdCanvas","cdTooltip",state.cdScreen));
+  $("cdCanvas").addEventListener("mouseleave",()=>hideTooltip("cdTooltip"));
+  $("ldCanvas").addEventListener("mousemove",e=>handleSeriesHover(e,"ldCanvas","ldTooltip",state.ldScreen));
+  $("ldCanvas").addEventListener("mouseleave",()=>hideTooltip("ldTooltip"));
+  $("compareCanvas").addEventListener("mousemove",handleCompareHover);
+  $("compareCanvas").addEventListener("mouseleave",()=>hideTooltip("compareTooltip"));
+  $("versionDiffCanvas").addEventListener("mousemove",e=>handleSeriesHover(e,"versionDiffCanvas","versionDiffTooltip",state.versionDiffScreen));
+  $("versionDiffCanvas").addEventListener("mouseleave",()=>hideTooltip("versionDiffTooltip"));
+  $("runSqlBtn").addEventListener("click",runSql);
+  document.querySelectorAll(".queryTemplateBtn").forEach(btn=>btn.addEventListener("click",()=>loadQueryTemplate(btn.dataset.template)));
+  $("loadUsersBtn").addEventListener("click",loadUsers);
+  $("loadLogsBtn").addEventListener("click",loadLogs);
+  document.querySelectorAll(".adminTraceBtn").forEach(btn=>btn.addEventListener("click",()=>openAdminReviewTable(btn.dataset.table)));
+  $("loadMainTableBtn").addEventListener("click",loadMainTable);
+  $("adminTableSelect").addEventListener("change",changeMainTable);
+  $("toggleMainAddBtn").addEventListener("click",toggleMainAddForm);
+  $("mainTableModeBtn").addEventListener("click",showMainTableMode);
+  document.querySelectorAll(".governanceBtn").forEach(btn=>btn.addEventListener("click",()=>runDataGovernance(btn.dataset.scenario)));
+  $("adminCreateUserBtn").addEventListener("click",adminCreateUser);
+  $("createAirfoilBtn").addEventListener("click",createAirfoil);
+  $("updateAirfoilBtn").addEventListener("click",updateAirfoilRecord);
+  $("updatePerformanceBtn").addEventListener("click",updatePerformanceRecord);
+  $("updateAnomalyBtn").addEventListener("click",updateAnomalyRecord);
+  $("rollbackTransactionBtn").addEventListener("click",()=>runTransaction("rollback"));
+  $("commitTransactionBtn").addEventListener("click",()=>runTransaction("commit"));
+  $("saveTransactionBtn").addEventListener("click",saveCurrentTransaction);
+  $("loadSavedTransactionBtn").addEventListener("click",loadSelectedSavedTransaction);
+  $("deleteSavedTransactionBtn").addEventListener("click",deleteSelectedSavedTransaction);
+  $("concurrencyScenarioBtn").addEventListener("click",runConcurrencyScenario);
+  $("bulkImportScenarioBtn").addEventListener("click",loadBulkImportScenario);
+  $("versionScenarioBtn").addEventListener("click",loadVersionAtomicScenario);
+  document.querySelectorAll(".dbObjectBtn").forEach(btn=>btn.addEventListener("click",()=>runDbObjectExperiment(btn.dataset.scenario)));
+  $("loadGoodBatchBtn").addEventListener("click",()=>loadBatchSample("good"));
+  $("loadBadBatchBtn").addEventListener("click",()=>loadBatchSample("bad"));
+  $("runBatchImportBtn").addEventListener("click",runBatchImport);
+  $("batchImportTarget").addEventListener("change",updateBatchHeaderHint);
+  $("batchImportFile").addEventListener("change",loadBatchFile);
+  $("indexTableSelect").addEventListener("change",loadIndexColumns);
+  $("loadIndexesBtn").addEventListener("click",loadIndexes);
+  $("showCreateIndexBtn").addEventListener("click",()=>showIndexForm("create"));
+  $("createIndexBtn").addEventListener("click",createIndex);
+  $("runIndexBtn").addEventListener("click",runIndex);
+  window.addEventListener("resize",()=>{drawShape();drawPerformance();drawCd();drawLd();scheduleSecondaryCharts();});
+  updateBatchHeaderHint();
+  await loadMe();
+  if(state.currentUser)await loadAppData();
+}
+async function loadAppData(){
+  const [summary,airfoils]=await Promise.all([getJson("/api/summary"),getJson("/api/airfoils")]);
+  state.airfoils=airfoils;
+  $("summary").textContent=`${summary.airfoils} 个翼型 · ${summary.coordinate_points} 个坐标点 · ${summary.performance_records} 条性能记录`;
+  renderAirfoilList();
+  const current=state.selectedAirfoil&&airfoils.some(a=>a.airfoil_id===state.selectedAirfoil)?state.selectedAirfoil:(airfoils[0]?airfoils[0].airfoil_id:null);
+  if(current)selectAirfoil(current).catch(err=>console.error(err));
+  if(canUseMainData()){
+    loadMainTableFilters().catch(err=>console.error(err));
+    if(!isAdmin())loadMainTable().catch(err=>console.error(err));
+  }
+  if(isAdmin()){
+    loadIndexTables().catch(err=>console.error(err));
+    refreshIndexStatus().catch(err=>console.error(err));
+    loadIndexes().catch(err=>console.error(err));
+  }
+  state.appDataLoaded=true;
+}
+async function loadMe(){const previousUserId=state.currentUser?state.currentUser.user_id:null;const data=await getJson("/api/auth/me"); state.currentUser=data.authenticated?data.user:null; const nextUserId=state.currentUser?state.currentUser.user_id:null; updateAuth(previousUserId!==nextUserId);}
+function updateAuth(userChanged=false){
+  const u=state.currentUser;
+  if(!u){
+    $("authGate").style.display="grid";
+    $("appShell").classList.remove("visible");
+    $("userStatus").textContent="Not logged in";
+    $("permissionHint").textContent="Login to query. Register creates viewer only.";
+    $("loggedInBar").style.display="none";
+    state.savedTransactions=[];
+    renderSavedTransactions();
+    resetTransactionEditor();
+    $("adminPanel").classList.remove("visible");
+    $("editorPanel").classList.remove("visible");
+    $("transactionPanel").classList.remove("visible");
+    $("dbObjectPanel").classList.remove("visible");
+    $("batchPanel").classList.remove("visible");
+    $("governancePanel").classList.remove("visible");
+    return;
+  }
+  $("authGate").style.display="none";
+  $("appShell").classList.add("visible");
+  $("loggedInBar").style.display="flex";
+  $("userStatus").textContent=isAdmin()?`Current user: ${u.username} · ${u.role} · full admin`:canUseMainData()?`Current user: ${u.username} · ${u.role} · main data access`:`Current user: ${u.username} · ${u.role} · read-only`;
+  $("permissionHint").textContent=isAdmin()?"Admin SQL: SELECT/INSERT/UPDATE/DELETE/CREATE INDEX/DROP INDEX":"Guided queries only; use Main Data for no-SQL access";
+  $("adminPanel").classList.toggle("visible",isAdmin());
+  $("editorPanel").classList.remove("visible");
+  $("transactionPanel").classList.toggle("visible",isAdmin());
+  $("dbObjectPanel").classList.toggle("visible",isAdmin());
+  $("batchPanel").classList.toggle("visible",isAdmin());
+  $("governancePanel").classList.toggle("visible",canUseMainData());
+  $("governanceExperimentHeader").style.display=isAdmin()?"":"none";
+  $("governanceExperimentButtons").style.display=isAdmin()?"":"none";
+  document.querySelector('[data-tab="sql"]').style.display=isAdmin()?"inline-flex":"none";
+  document.querySelector('[data-tab="index"]').style.display=isAdmin()?"inline-flex":"none";
+  document.querySelector('[data-tab="transaction"]').style.display=isAdmin()?"inline-flex":"none";
+  document.querySelector('[data-tab="dbobjects"]').style.display=isAdmin()?"inline-flex":"none";
+  document.querySelector('[data-tab="batch"]').style.display=isAdmin()?"inline-flex":"none";
+  document.querySelector('[data-tab="governance"]').style.display=canUseMainData()?"inline-flex":"none";
+  document.querySelector('[data-tab="admin"]').style.display=isAdmin()?"inline-flex":"none";
+  if((!isAdmin()&&($("pageSql").classList.contains("active")||$("pageIndex").classList.contains("active")||$("pageTransaction").classList.contains("active")||$("pageDbObjects").classList.contains("active")||$("pageBatch").classList.contains("active")||$("pageAdmin").classList.contains("active")))||(!canUseMainData()&&$("pageGovernance").classList.contains("active"))){
+    showPage("overview");
+  }
+  $("adminCreateUserRow").style.display=isAdmin()?"grid":"none";
+  if(userChanged)resetTransactionEditor();
+  if(canUseMainData()){
+    syncMainTableOptions();
+  }
+  if(userChanged&&canUseMainData()&&!isAdmin()){
+    showPage("governance");
+    loadMainTable();
+  }
+  refreshSavedTransactions();
+}
+async function gateLogin(){try{$("gateMessage").textContent="正在登录...";const data=await postJson("/api/auth/login",{username:$("gateName").value.trim(),password:$("gatePassword").value});await loadMe();$("gateMessage").textContent=`Login ok: ${data.username} (${data.role})`;if(state.currentUser)loadAppData().catch(err=>{$("gateMessage").textContent=`Load data failed: ${err.message||err}`;});}catch(e){$("gateMessage").textContent=`Login failed: ${e.error||"unknown error"}`;}}
+async function gateRegisterViewer(){try{$("gateMessage").textContent="正在注册...";const data=await postJson("/api/auth/register",{username:$("gateName").value.trim(),password:$("gatePassword").value});await loadMe();$("gateMessage").textContent=`Register ok: ${data.username} (${data.role})`;if(state.currentUser)loadAppData().catch(err=>{$("gateMessage").textContent=`Load data failed: ${err.message||err}`;});}catch(e){$("gateMessage").textContent=`Register failed: ${e.error||"unknown error"}`;}}
+async function logout(){try{$("userStatus").textContent="Logging out...";await postJson("/api/auth/logout");}finally{state.currentUser=null; state.appDataLoaded=false; state.airfoils=[]; state.selectedAirfoil=null; $("gatePassword").value=""; updateAuth(true); $("gateMessage").textContent="Logged out"; $("sqlResult").textContent="Logged out";}}
+async function runSql(){try{const data=await postJson("/api/query_logs/run",{sql:$("sqlInput").value});showSqlResult($("sqlResult"),data);}catch(e){$("sqlResult").textContent=`SQL failed: ${e.error||"unknown error"}`;}}
+async function loadQueryTemplate(kind){
+  const templates={
+    airfoil_summary:`SELECT airfoil_id, name, family, source_type, final_point_count
+FROM airfoils
+ORDER BY final_point_count DESC
+LIMIT 20;`,
+    performance_rank:`SELECT airfoil_id, version_id, reynolds_number, MAX(cl) AS max_cl, MIN(cd) AS min_cd, MAX(cl / NULLIF(cd, 0)) AS max_ld
+FROM performance_records
+WHERE reynolds_number = 50000
+GROUP BY airfoil_id, version_id, reynolds_number
+ORDER BY max_ld DESC
+LIMIT 20;`,
+    anomaly_review:`SELECT ar.anomaly_id, ar.perf_id, ar.airfoil_id, ar.version_id, ar.rule_type, p.alpha_deg, p.reynolds_number, p.cl, p.cd
+FROM anomaly_records ar
+JOIN performance_records p
+  ON p.perf_id = ar.perf_id
+ORDER BY ar.anomaly_id
+LIMIT 50;`,
+    version_trace:`SELECT a.airfoil_id, a.name, dv.version_id, dv.version_type, dv.coordinate_source_type, dv.description
+FROM airfoils a
+JOIN data_versions dv ON dv.airfoil_id = a.airfoil_id
+WHERE a.airfoil_id = 'ag03'
+ORDER BY dv.version_id;`
+  };
+  $("sqlInput").value=templates[kind]||templates.airfoil_summary;
+  const target=$("pageGovernance").classList.contains("active")?$("governanceResult"):$("sqlResult");
+  target.textContent="Running guided query...";
+  try{
+    const data=await postJson("/api/query_logs/run",{sql:$("sqlInput").value,natural_language:`guided query: ${kind}`});
+    showSqlResult(target,data);
+  }catch(e){
+    target.textContent=`Guided query failed: ${e.error||"unknown error"}`;
+  }
+}
+async function runDataGovernance(scenario){
+  try{
+    showMainTableSection(false);
+    $("governanceResult").style.display="block";
+    $("governanceResult").textContent="Running data governance check...";
+    $("mainTableModeBtn").classList.remove("primary");
+    document.querySelectorAll(".governanceBtn").forEach(b=>b.classList.toggle("primary",b.dataset.scenario===scenario));
+    const d=await postJson("/api/data_governance/run",{
+      scenario,
+      airfoil_id:"",
+      perf_id:"",
+      limit:"80"
+    });
+    const pieces=[`<div class="status">Scenario=${escapeHtml(d.scenario)} · Time=${d.elapsed_ms} ms</div>`];
+    (d.sections||[]).forEach(section=>{
+      pieces.push(`<h2>${escapeHtml(section.title)}</h2>`);
+      if(section.note){pieces.push(`<div class="status">${escapeHtml(section.note)}</div>`);}
+      pieces.push(rowsToTable(section.rows||[]));
+    });
+    $("governanceResult").innerHTML=pieces.join("");
+  }catch(e){
+    $("governanceResult").textContent=`Data governance check failed: ${e.error||"unknown error"}`;
+  }
+}
+function showMainTableSection(visible){
+  const section=$("mainTableSection");
+  if(section)section.style.display=visible?"grid":"none";
+}
+async function showMainTableMode(){
+  showMainTableSection(true);
+  $("governanceResult").style.display="none";
+  document.querySelectorAll(".governanceBtn").forEach(b=>b.classList.remove("primary"));
+  $("mainTableModeBtn").classList.add("primary");
+  $("mainTableResult").textContent="请选择关系并查看主表。";
+  await loadMainTableFilters();
+}
+async function loadUsers(){try{$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/users"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
+async function loadLogs(){try{$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/query_logs"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
+async function openAdminReviewTable(table){
+  try{
+    showPage("admin");
+    const target=$("adminAuditTargetSelect")?.value||"airfoils";
+    const params=new URLSearchParams({table,limit:"100"});
+    if(table==="data_record_lineage"||table==="audit_logs"||table==="soft_delete_records"){
+      params.set("filter_table_name",target);
+    }else if(table==="data_import_records"){
+      params.set("filter_target_table",target);
+    }
+    $("adminResult").textContent=`正在审查 ${table} / ${target}...`;
+    const data=await getJson(`/api/admin/main_table?${params.toString()}`);
+    const label=table==="users"||table==="query_logs" ? data.table : `${data.table} · target ${target}`;
+    $("adminResult").innerHTML=`<div class="status">Admin review: ${escapeHtml(label)} · showing ${data.rows.length} / ${data.total} rows</div>${rowsToTable(data.rows,{table:data.table})}`;
+    attachAdminResultActions();
+  }catch(e){
+    $("adminResult").textContent=e.error||e.message||String(e);
+  }
+}
+async function restoreSoftDeletedRecord(deleteId,table,recordPk){
+  if(!confirm(`确认恢复 ${table}.${recordPk}？\n恢复后该记录会重新出现在主表查询和图表中。`))return;
+  try{
+    $("adminResult").insertAdjacentHTML("afterbegin",`<div class="status" id="restoreStatus">正在恢复 ${escapeHtml(table)}.${escapeHtml(recordPk)}...</div>`);
+    const data=await postJson("/api/main_records/restore",{delete_id:deleteId});
+    const status=$("restoreStatus");
+    if(status)status.textContent=`已恢复 ${data.table}.${data.record_pk}，Time=${data.elapsed_ms} ms`;
+    state.airfoils=await getJson("/api/airfoils");
+    renderAirfoilList();
+    if(state.selectedAirfoil)loadVersionData().catch(err=>console.error(err));
+    if($("pageGovernance").classList.contains("active"))loadMainTable().catch(err=>console.error(err));
+    await openAdminReviewTable("soft_delete_records");
+  }catch(e){
+    $("adminResult").insertAdjacentHTML("afterbegin",`<div class="status danger">恢复失败：${escapeHtml(e.error||e.message||"unknown error")}</div>`);
+  }
+}
+function attachAdminResultActions(){
+  document.querySelectorAll(".restoreDeleteBtn").forEach(btn=>{
+    btn.addEventListener("click",()=>restoreSoftDeletedRecord(btn.dataset.deleteId,btn.dataset.table,btn.dataset.recordPk));
+  });
+}
+function syncMainTableOptions(){
+  const blocked=new Set(["users","query_logs","audit_logs","data_record_lineage","data_import_records","soft_delete_records","performance_import_staging","saved_transactions"]);
+  Array.from($("adminTableSelect").options).forEach(option=>{
+    option.hidden=!isAdmin()&&blocked.has(option.value);
+  });
+  if($("adminTableSelect").selectedOptions[0]?.hidden){
+    $("adminTableSelect").value="airfoils";
+  }
+}
+async function loadMainTableFilters(){
+  syncMainTableOptions();
+  const table=$("adminTableSelect").value;
+  const previous={};
+  document.querySelectorAll(".mainTableFilter").forEach(select=>previous[select.dataset.column]=select.value);
+  try{
+    if(!state.mainFilterCache[table])$("mainTableFilterBox").innerHTML=`<div class="status">正在加载 ${escapeHtml(table)} 的筛选项...</div>`;
+    const data=state.mainFilterCache[table]||await getJson(`/api/admin/main_table?table=${encodeURIComponent(table)}&limit=1&include_options=1`);
+    state.mainFilterCache[table]=data;
+    const filterColumns=data.filter_columns||[];
+    const options=data.filter_options||{};
+    $("mainTableFilterBox").innerHTML=filterColumns.length?filterColumns.map(column=>{
+      const values=options[column]||[];
+      return `<label class="keyFilter"><span>${escapeHtml(column)}</span><select class="mainTableFilter" data-column="${escapeHtml(column)}"><option value="">全部</option>${values.map(value=>`<option value="${escapeHtml(value)}" ${String(previous[column]||"")===String(value)?"selected":""}>${escapeHtml(value)}</option>`).join("")}</select></label>`;
+    }).join(""):`<div class="status">当前关系没有配置主键筛选项，默认显示全部记录。</div>`;
+    document.querySelectorAll(".mainTableFilter").forEach(select=>select.addEventListener("change",loadMainTable));
+    renderMainAddForm(false);
+  }catch(e){
+    $("mainTableFilterBox").innerHTML="";
+    $("mainTableResult").textContent=e.error||e.message||String(e);
+  }
+}
+async function changeMainTable(){
+  await loadMainTableFilters();
+  await loadMainTable();
+}
+function mainAddAllowedTable(){return ["data_sources","airfoils","data_versions","coordinate_points"].includes($("adminTableSelect").value);}
+function renderMainAddForm(visible){
+  const table=$("adminTableSelect").value;
+  const canAdd=isManager()&&mainAddAllowedTable();
+  $("mainAddControls").style.display=canAdd?"flex":"none";
+  if(!canAdd){
+    $("mainAddBox").style.display="none";
+    $("mainAddBox").innerHTML="";
+    return;
+  }
+  $("mainAddBox").style.display=visible?"grid":"none";
+  $("toggleMainAddBtn").textContent=visible?"- 收起添加":"+ 添加记录";
+  if(!visible)return;
+  const sourceOptions=`<option value="uiuc_raw">uiuc_raw</option><option value="uiuc_raw_with_tracked_augmentation">uiuc_raw_with_tracked_augmentation</option><option value="generated_synthetic">generated_synthetic</option><option value="injected_anomaly">injected_anomaly</option>`;
+  const field=(name,placeholder="",value="")=>`<label class="keyFilter"><span>${escapeHtml(name)}</span><input class="mainAddInput" data-field="${escapeHtml(name)}" placeholder="${escapeHtml(placeholder||name)}" value="${escapeHtml(value)}"></label>`;
+  const select=(name,options)=>`<label class="keyFilter"><span>${escapeHtml(name)}</span><select class="mainAddInput" data-field="${escapeHtml(name)}">${options}</select></label>`;
+  const airfoilOptions=(state.airfoils||[]).map(a=>`<option value="${escapeHtml(a.airfoil_id)}" ${a.airfoil_id===state.selectedAirfoil?"selected":""}>${escapeHtml(a.airfoil_id)} · ${escapeHtml(a.name||"")}</option>`).join("");
+  let html="";
+  if(table==="data_sources"){
+    html=select("source_type",sourceOptions)+field("description","真实来源或生成规则说明");
+  }else if(table==="airfoils"){
+    html=[
+      field("airfoil_id","如 naca0012"),
+      field("name","翼型名称"),
+      field("source","UIUC / Frontend Input","Frontend Input"),
+      field("family","系列","Manual"),
+      select("source_type",sourceOptions),
+      field("source_file","来源文件","frontend\\new_airfoil.dat"),
+      field("original_point_count","原始点数","1"),
+      field("final_point_count","最终点数","1"),
+    ].join("");
+  }else if(table==="data_versions"){
+    html=[
+      select("airfoil_id",airfoilOptions||`<option value="">请先加载 airfoils</option>`),
+      field("version_id","版本号","1"),
+      select("version_type",`<option value="imported_raw">imported_raw</option><option value="augmented_from_raw">augmented_from_raw</option>`),
+      select("coordinate_source_type",`<option value="real_only">real_only</option><option value="mixed_real_and_augmented">mixed_real_and_augmented</option>`),
+      field("description","版本说明","Frontend created data version"),
+    ].join("");
+  }else if(table==="coordinate_points"){
+    html=[
+      select("airfoil_id",airfoilOptions||`<option value="">请先加载 airfoils</option>`),
+      field("version_id","版本号","1"),
+      field("point_order","点序号","1"),
+      field("x","x 坐标","0.0"),
+      field("y","y 坐标","0.0"),
+      select("surface",`<option value="upper">upper</option><option value="lower">lower</option>`),
+      select("point_source",`<option value="real">real</option><option value="augmented">augmented</option>`),
+      select("is_augmented",`<option value="0">0</option><option value="1">1</option>`),
+      field("original_order","原始序号，可空",""),
+      select("augmentation_method",`<option value="original_coordinate">original_coordinate</option><option value="linear_interpolation">linear_interpolation</option>`),
+    ].join("");
+  }
+  $("mainAddBox").innerHTML=html+`<button class="action primary" id="submitMainAddBtn">保存新增</button>`;
+  attachMainAddFieldBehaviors(table);
+  $("submitMainAddBtn").addEventListener("click",submitMainAddForm);
+}
+function attachMainAddFieldBehaviors(table){
+  if(table!=="coordinate_points")return;
+  const pointSource=document.querySelector('.mainAddInput[data-field="point_source"]');
+  const isAugmented=document.querySelector('.mainAddInput[data-field="is_augmented"]');
+  const method=document.querySelector('.mainAddInput[data-field="augmentation_method"]');
+  if(!pointSource||!isAugmented||!method)return;
+  const sync=()=>{
+    if(pointSource.value==="augmented"){
+      isAugmented.value="1";
+      method.value="linear_interpolation";
+    }else{
+      isAugmented.value="0";
+      method.value="original_coordinate";
+    }
+  };
+  pointSource.addEventListener("change",sync);
+  isAugmented.addEventListener("change",()=>{
+    pointSource.value=isAugmented.value==="1"?"augmented":"real";
+    sync();
+  });
+  method.addEventListener("change",()=>{
+    pointSource.value=method.value==="linear_interpolation"?"augmented":"real";
+    sync();
+  });
+  sync();
+}
+function toggleMainAddForm(){
+  const visible=$("mainAddBox").style.display==="none";
+  renderMainAddForm(visible);
+}
+async function submitMainAddForm(){
+  try{
+    const table=$("adminTableSelect").value;
+    const data={};
+    document.querySelectorAll(".mainAddInput").forEach(input=>data[input.dataset.field]=input.value.trim());
+    $("mainTableResult").textContent=`正在添加 ${table} 记录...`;
+    const result=await postJson("/api/main_records/create",{table,data});
+    $("mainTableResult").innerHTML=`<div class="status">Created ${escapeHtml(result.table)}.${escapeHtml(result.record_pk)} · Time=${result.elapsed_ms} ms</div>${rowsToTable(result.rows,{table:result.table})}`;
+    state.mainFilterCache={};
+    await loadMainTableFilters();
+    await loadMainTable();
+    if(table==="airfoils"){
+      state.airfoils=await getJson("/api/airfoils");
+      renderAirfoilList();
+    }
+  }catch(e){
+    $("mainTableResult").textContent=`Create record failed: ${e.error||e.message||"unknown error"}`;
+  }
+}
+function inlineField(name,label,value,type="text",readOnly=false){
+  return `<label>${escapeHtml(label)}<input class="inlineEditInput" data-field="${escapeHtml(name)}" type="${escapeHtml(type)}" value="${escapeHtml(value??"")}" ${readOnly?"readonly":""}></label>`;
+}
+function inlineSelect(name,label,value,options){
+  return `<label>${escapeHtml(label)}<select class="inlineEditInput" data-field="${escapeHtml(name)}">${options.map(opt=>`<option value="${escapeHtml(opt)}" ${String(value??"")===String(opt)?"selected":""}>${escapeHtml(opt)}</option>`).join("")}</select></label>`;
+}
+function renderInlineEditForm(table,row,colspan){
+  const sourceTypes=["uiuc_raw","uiuc_raw_with_tracked_augmentation","generated_synthetic","injected_anomaly"];
+  const ruleTypes=["negative_cd","extreme_cl","missing_geometry","invalid_reynolds","manual_review"];
+  let fields="";
+  if(table==="airfoils"){
+    fields=[
+      inlineField("airfoil_id","airfoil_id",row.airfoil_id,"text",true),
+      inlineField("name","name",row.name),
+      inlineField("source","source",row.source),
+      inlineField("family","family",row.family),
+      inlineSelect("is_generated","is_generated",String(row.is_generated??0),["0","1"]),
+      inlineSelect("source_type","source_type",row.source_type??"uiuc_raw",sourceTypes),
+      inlineField("source_file","source_file",row.source_file),
+      inlineSelect("has_augmented_coordinates","has_augmented_coordinates",String(row.has_augmented_coordinates??0),["0","1"]),
+      inlineField("original_point_count","original_point_count",row.original_point_count,"number"),
+      inlineField("final_point_count","final_point_count",row.final_point_count,"number")
+    ].join("");
+  }else if(table==="data_sources"){
+    fields=[
+      inlineField("source_type","source_type",row.source_type,"text",true),
+      `<label>description<textarea class="inlineEditInput" data-field="description">${escapeHtml(row.description??"")}</textarea></label>`
+    ].join("");
+  }else if(table==="data_versions"){
+    fields=[
+      inlineField("airfoil_id","airfoil_id",row.airfoil_id,"text",true),
+      inlineField("version_id","version_id",row.version_id,"number",true),
+      inlineSelect("version_type","version_type",row.version_type??"imported_raw",["imported_raw","augmented_from_raw"]),
+      inlineSelect("coordinate_source_type","coordinate_source_type",row.coordinate_source_type??"real_only",["real_only","mixed_real_and_augmented"]),
+      `<label>description<textarea class="inlineEditInput" data-field="description">${escapeHtml(row.description??"")}</textarea></label>`
+    ].join("");
+  }else if(table==="coordinate_points"){
+    fields=[
+      inlineField("airfoil_id","airfoil_id",row.airfoil_id,"text",true),
+      inlineField("version_id","version_id",row.version_id,"number",true),
+      inlineField("point_order","point_order",row.point_order,"number",true),
+      inlineField("x","x",row.x,"number"),
+      inlineField("y","y",row.y,"number"),
+      inlineSelect("surface","surface",row.surface??"upper",["upper","lower"]),
+      inlineSelect("point_source","point_source",row.point_source??"real",["real","augmented"]),
+      inlineSelect("is_augmented","is_augmented",String(row.is_augmented??0),["0","1"]),
+      inlineField("original_order","original_order",row.original_order??"","number"),
+      inlineSelect("augmentation_method","augmentation_method",row.augmentation_method??"original_coordinate",["original_coordinate","linear_interpolation"])
+    ].join("");
+  }else if(table==="performance_records"){
+    fields=[
+      inlineField("perf_id","perf_id",row.perf_id,"number",true),
+      inlineField("cl","cl",row.cl,"number"),
+      inlineField("cd","cd",row.cd,"number"),
+      inlineField("cm","cm",row.cm,"number"),
+      inlineSelect("is_anomaly","is_anomaly",String(row.is_anomaly??0),["0","1"])
+    ].join("");
+  }else if(table==="anomaly_records"){
+    fields=[
+      inlineField("anomaly_id","anomaly_id",row.anomaly_id,"number",true),
+      inlineField("perf_id","perf_id",row.perf_id,"number"),
+      inlineField("airfoil_id","airfoil_id",row.airfoil_id),
+      inlineField("version_id","version_id",row.version_id,"number"),
+      inlineSelect("rule_type","rule_type",row.rule_type??"extreme_cl",ruleTypes),
+      `<label>detail<textarea class="inlineEditInput" data-field="detail">${escapeHtml(row.detail??"")}</textarea></label>`
+    ].join("");
+  }
+  return `<tr class="inlineEditRow"><td class="inlineEditCell" colspan="${colspan}"><div class="inlineEditBox"><div class="status">正在编辑 ${escapeHtml(table)} 的当前记录</div><div class="inlineEditGrid">${fields}</div><div class="inlineEditActions"><button class="action primary inlineSaveBtn" data-table="${escapeHtml(table)}">保存修改</button><button class="action inlineCancelBtn">取消</button><span class="status inlineEditStatus"></span></div></div></td></tr>`;
+}
+function collectInlinePayload(rowEl){
+  const payload={};
+  rowEl.querySelectorAll(".inlineEditInput").forEach(input=>payload[input.dataset.field]=input.value.trim());
+  return payload;
+}
+async function submitInlineEdit(table,rowEl){
+  const status=rowEl.querySelector(".inlineEditStatus");
+  const payload=collectInlinePayload(rowEl);
+  const endpoint={data_sources:"/api/data_sources/update",airfoils:"/api/airfoils/update",data_versions:"/api/data_versions/update",coordinate_points:"/api/coordinate_points/update",performance_records:"/api/performance_records/update",anomaly_records:"/api/anomaly_records/update"}[table];
+  try{
+    status.textContent="正在保存...";
+    const data=await postJson(endpoint,payload);
+    status.textContent=`已保存，Affected=${data.affected_rows}，Time=${data.elapsed_ms} ms`;
+    if(table==="airfoils"){
+      getJson("/api/airfoils").then(rows=>{state.airfoils=rows;renderAirfoilList();}).catch(err=>console.error(err));
+      if(state.selectedAirfoil===payload.airfoil_id)selectAirfoil(payload.airfoil_id).catch(err=>console.error(err));
+    }else if(state.selectedAirfoil){
+      loadVersionData().catch(err=>console.error(err));
+    }
+    setTimeout(()=>loadMainTable().catch(err=>console.error(err)),350);
+  }catch(e){
+    status.textContent=`保存失败：${e.error||e.message||"unknown error"}`;
+  }
+}
+async function softDeleteMainRecord(table,row){
+  const label=row.airfoil_id||row.perf_id||row.anomaly_id||row.source_type||row.record_pk||"当前记录";
+  if(!confirm(`确认逻辑删除 ${table}.${label}？\n业务表不会物理删除，完整行数据会写入 soft_delete_records。`))return;
+  try{
+    $("mainTableResult").insertAdjacentHTML("afterbegin",`<div class="status" id="softDeleteStatus">正在逻辑删除 ${escapeHtml(table)}.${escapeHtml(label)}...</div>`);
+    const data=await postJson("/api/main_records/delete",{table,row,reason:"frontend logical delete"});
+    const status=$("softDeleteStatus");
+    if(status)status.textContent=`已逻辑删除 ${data.table}.${data.record_pk}，Time=${data.elapsed_ms} ms`;
+    if(table==="airfoils"){
+      state.airfoils=await getJson("/api/airfoils");
+      renderAirfoilList();
+      if(state.selectedAirfoil===row.airfoil_id){
+        const next=state.airfoils[0]?.airfoil_id;
+        state.selectedAirfoil=next||null;
+        if(next)await selectAirfoil(next);
+      }
+    }else if(state.selectedAirfoil){
+      loadVersionData().catch(err=>console.error(err));
+    }
+    await loadMainTable();
+  }catch(e){
+    $("mainTableResult").insertAdjacentHTML("afterbegin",`<div class="status danger">逻辑删除失败：${escapeHtml(e.error||e.message||"unknown error")}</div>`);
+  }
+}
+function attachMainTableRowActions(){
+  document.querySelectorAll(".rowEditBtn").forEach(button=>{
+    button.addEventListener("click",()=>{
+      document.querySelectorAll(".inlineEditRow").forEach(row=>row.remove());
+      const table=button.dataset.table;
+      const row=JSON.parse(button.dataset.row||"{}");
+      const currentTr=button.closest("tr");
+      const colspan=currentTr.children.length;
+      currentTr.insertAdjacentHTML("afterend",renderInlineEditForm(table,row,colspan));
+      const editRow=currentTr.nextElementSibling;
+      editRow.querySelector(".inlineCancelBtn").addEventListener("click",()=>editRow.remove());
+      editRow.querySelector(".inlineSaveBtn").addEventListener("click",()=>submitInlineEdit(table,editRow));
+    });
+  });
+  document.querySelectorAll(".mainRowDeleteBtn").forEach(button=>{
+    button.addEventListener("click",()=>{
+      const table=button.dataset.table;
+      const row=JSON.parse(button.dataset.row||"{}");
+      softDeleteMainRecord(table,row);
+    });
+  });
+}
+async function loadMainTable(){
+  try{
+    showMainTableSection(true);
+    $("governanceResult").style.display="none";
+    syncMainTableOptions();
+    const params=new URLSearchParams({table:$("adminTableSelect").value,limit:$("adminLimitSelect").value});
+    document.querySelectorAll(".mainTableFilter").forEach(input=>{
+      const value=input.value.trim();
+      if(value)params.set(`filter_${input.dataset.column}`,value);
+    });
+    $("mainTableResult").textContent=`正在查询 ${$("adminTableSelect").value}...`;
+    const data=await getJson(`/api/admin/main_table?${params.toString()}`);
+    const activeFilters=Object.entries(data.filters||{}).map(([k,v])=>`${escapeHtml(k)} = "${escapeHtml(v)}"`).join(" · ")||"全部";
+    $("mainTableResult").innerHTML=`<div class="status">Table: ${escapeHtml(data.table)} · showing ${data.rows.length} / ${data.total} rows · filters: ${activeFilters}</div>`+rowsToTable(data.rows,{table:data.table});
+    attachMainTableRowActions();
+  }catch(e){
+    $("mainTableResult").textContent=e.error||e.message||String(e);
+  }
+}
+async function adminCreateUser(){try{const data=await postJson("/api/admin/users/create",{username:$("adminNewUsername").value.trim(),password:$("adminNewPassword").value,role:$("adminNewRole").value});$("adminResult").textContent=`Created user: ${data.username} (${data.role})`; $("adminNewPassword").value="";}catch(e){$("adminResult").textContent=`Create user failed: ${e.error||"unknown error"}`;}}
+async function createAirfoil(){try{const c=Number($("newAirfoilPoints").value||1);const id=$("newAirfoilId").value.trim();const data=await postJson("/api/airfoils/create",{airfoil_id:id,name:$("newAirfoilName").value.trim(),family:$("newAirfoilFamily").value.trim()||"Manual",original_point_count:c,final_point_count:c,source_file:`manual\\${id}.dat`});$("sqlResult").textContent=`Create ok: ${data.airfoil_id}`;state.airfoils=await getJson("/api/airfoils");renderAirfoilList();}catch(e){$("sqlResult").textContent=`Create failed: ${e.error||"unknown error"}`;}}
+async function updateAirfoilRecord(){
+  try{
+    $("governanceResult").textContent="正在更新 airfoils 记录...";
+    const payload={
+      airfoil_id:$("editAirfoilId").value.trim(),
+      name:$("editAirfoilName").value.trim(),
+      source:$("editAirfoilSource").value.trim(),
+      family:$("editAirfoilFamily").value.trim(),
+      is_generated:$("editAirfoilGenerated").value,
+      source_type:$("editAirfoilSourceType").value,
+      source_file:$("editAirfoilSourceFile").value.trim(),
+      has_augmented_coordinates:$("editAirfoilAugmented").value,
+      original_point_count:$("editAirfoilOriginalPoints").value.trim(),
+      final_point_count:$("editAirfoilFinalPoints").value.trim()
+    };
+    const data=await postJson("/api/airfoils/update",payload);
+    $("governanceResult").innerHTML=`<div class="status">Updated airfoil. Affected=${data.affected_rows} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows,{table:"airfoils"})}`;
+    getJson("/api/airfoils").then(rows=>{state.airfoils=rows;renderAirfoilList();}).catch(err=>console.error(err));
+    if($("adminTableSelect").value==="airfoils")loadMainTable().catch(err=>console.error(err));
+    if(state.selectedAirfoil===payload.airfoil_id)selectAirfoil(payload.airfoil_id).catch(err=>console.error(err));
+  }catch(e){
+    $("governanceResult").textContent=`Update airfoil failed: ${e.error||"unknown error"}`;
+  }
+}
+async function updatePerformanceRecord(){
+  try{
+    $("governanceResult").textContent="正在更新 performance_records 记录...";
+    const payload={
+      perf_id:$("editPerfId").value.trim(),
+      cl:$("editCl").value.trim(),
+      cd:$("editCd").value.trim(),
+      cm:$("editCm").value.trim(),
+      is_anomaly:$("editIsAnomaly").value
+    };
+    const data=await postJson("/api/performance_records/update",payload);
+    $("governanceResult").innerHTML=`<div class="status">Updated performance record. Affected=${data.affected_rows} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows)}`;
+    if($("adminTableSelect").value==="performance_records")loadMainTable().catch(err=>console.error(err));
+    if(state.selectedAirfoil)loadVersionData().catch(err=>console.error(err));
+  }catch(e){
+    $("governanceResult").textContent=`Update performance failed: ${e.error||"unknown error"}`;
+  }
+}
+async function updateAnomalyRecord(){
+  try{
+    $("governanceResult").textContent="正在更新 anomaly_records 记录...";
+    const payload={
+      anomaly_id:$("editAnomalyId").value.trim(),
+      perf_id:$("editAnomalyPerfId").value.trim(),
+      airfoil_id:$("editAnomalyAirfoilId").value.trim(),
+      version_id:$("editAnomalyVersionId").value.trim(),
+      rule_type:$("editAnomalyRuleType").value,
+      detail:$("editAnomalyDetail").value.trim()
+    };
+    const data=await postJson("/api/anomaly_records/update",payload);
+    $("governanceResult").innerHTML=`<div class="status">Updated anomaly record. Affected=${data.affected_rows} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows,{table:"anomaly_records"})}`;
+    if($("adminTableSelect").value==="anomaly_records")loadMainTable().catch(err=>console.error(err));
+    if(state.selectedAirfoil)loadVersionData().catch(err=>console.error(err));
+  }catch(e){
+    $("governanceResult").textContent=`Update anomaly failed: ${e.error||"unknown error"}`;
+  }
+}
+const BATCH_HEADERS={
+  data_sources:["source_type","description"],
+  airfoils:["airfoil_id","name","source","family","is_generated","source_type","source_file","has_augmented_coordinates","original_point_count","final_point_count"],
+  data_versions:["airfoil_id","version_id","version_type","coordinate_source_type","description"],
+  coordinate_points:["airfoil_id","version_id","point_order","x","y","surface","point_source","is_augmented","original_order","augmentation_method"],
+  performance_records:["perf_id","airfoil_id","version_id","alpha_deg","reynolds_number","cl","cd","cm","source_type","is_anomaly"],
+  anomaly_records:["anomaly_id","perf_id","airfoil_id","version_id","rule_type","detail"]
+};
+const BATCH_SAMPLES={
+  good:{
+    data_sources:`source_type,description
+ui_batch_source,Frontend CSV source description`,
+    airfoils:`airfoil_id,name,source,family,is_generated,source_type,source_file,has_augmented_coordinates,original_point_count,final_point_count
+batchaf01,Batch Airfoil 01,Frontend Batch,Manual,0,generated_synthetic,batch/batchaf01.dat,0,1,1`,
+    data_versions:`airfoil_id,version_id,version_type,coordinate_source_type,description
+ag03,2,augmented_from_raw,mixed_real_and_augmented,Frontend batch data version`,
+    coordinate_points:`airfoil_id,version_id,point_order,x,y,surface,point_source,is_augmented,original_order,augmentation_method
+ag03,1,999,0.5,0.02,upper,real,0,,original_coordinate`,
+    performance_records:`perf_id,airfoil_id,version_id,alpha_deg,reynolds_number,cl,cd,cm,source_type,is_anomaly
+9910201,ag03,1,-3,123460,0.36,0.013,0.0,generated_synthetic,0
+9910202,ag03,1,3,123460,0.66,0.015,0.0,generated_synthetic,0`,
+    anomaly_records:`anomaly_id,perf_id,airfoil_id,version_id,rule_type,detail
+990001,95,ag04,1,extreme_cl,Frontend batch anomaly note`
+  },
+  bad:{
+    performance_records:`perf_id,airfoil_id,version_id,alpha_deg,reynolds_number,cl,cd,cm,source_type,is_anomaly
+9910101,ag03,1,0,123459,0.52,0.011,0.0,generated_synthetic,0
+9910102,ag03,1,99,123459,0.60,0.014,0.0,generated_synthetic,0`
+  }
+};
+function updateBatchHeaderHint(){
+  const table=$("batchImportTarget").value;
+  const header=(BATCH_HEADERS[table]||[]).join(",");
+  $("batchExpectedHeader").innerHTML=`<b>目标关系：</b>${escapeHtml(table)}<br><b>期望表头：</b><code>${escapeHtml(header)}</code><br><span class="status">请保证 CSV/TSV 第一行表头与上面完全一致，列名不能缺失、不能多出、不能乱序；数据行也要按同样顺序填写。</span>`;
+}
+async function loadBatchFile(){
+  const file=$("batchImportFile").files[0];
+  if(!file)return;
+  $("batchImportInput").value=await file.text();
+  $("batchImportResult").textContent=`已读取本地文件：${file.name}。请核对目标关系和表头顺序后再导入。`;
+}
+function loadBatchSample(kind){
+  const table=$("batchImportTarget").value;
+  const sample=(BATCH_SAMPLES[kind]&&BATCH_SAMPLES[kind][table])||BATCH_SAMPLES.good[table]||BATCH_SAMPLES.good.performance_records;
+  $("batchImportId").value=kind==="bad"?"ui_bad_batch":"ui_good_batch";
+  $("batchImportInput").value=sample;
+  updateBatchHeaderHint();
+  $("batchImportResult").textContent=`Loaded ${kind} sample for ${table}. 请确认表头与目标关系属性顺序完全一致后导入。`;
+}
+function parseDelimitedLine(line,delimiter){
+  const values=[];
+  let current="";
+  let quoted=false;
+  for(let i=0;i<line.length;i++){
+    const ch=line[i];
+    if(ch==='"'){
+      if(quoted&&line[i+1]==='"'){current+='"';i++;}
+      else quoted=!quoted;
+    }else if(ch===delimiter&&!quoted){
+      values.push(current.trim());
+      current="";
+    }else{
+      current+=ch;
+    }
+  }
+  values.push(current.trim());
+  return values;
+}
+function parseDelimitedRows(text,table){
+  const lines=text.trim().split(/\r?\n/).filter(line=>line.trim().length>0);
+  if(lines.length<2)throw new Error("至少需要一行表头和一行数据。");
+  const delimiter=lines[0].includes("\t")?"\t":",";
+  const headers=parseDelimitedLine(lines[0],delimiter);
+  const expected=BATCH_HEADERS[table]||[];
+  if(headers.length!==expected.length||headers.some((h,i)=>h!==expected[i])){
+    throw new Error(`表头不匹配。请选择正确关系并按属性顺序排列。期望: ${expected.join(",")}；实际: ${headers.join(",")}`);
+  }
+  const rows=lines.slice(1).map((line,index)=>{
+    const values=parseDelimitedLine(line,delimiter);
+    if(values.length!==headers.length){
+      throw new Error(`第 ${index+2} 行列数不正确。期望 ${headers.length} 列，实际 ${values.length} 列。`);
+    }
+    const row={};
+    headers.forEach((h,i)=>row[h]=values[i]??"");
+    return row;
+  });
+  return {headers,rows};
+}
+async function runBatchImport(){
+  try{
+    const table=$("batchImportTarget").value;
+    const parsed=parseDelimitedRows($("batchImportInput").value,table);
+    const data=await postJson("/api/batch_import/run",{table,batch_id:$("batchImportId").value.trim(),headers:parsed.headers,rows:parsed.rows});
+    const pieces=[`<div class="status">Table=${escapeHtml(data.target_table||table)} · Batch=${escapeHtml(data.batch_id)} · Time=${data.elapsed_ms} ms</div>`];
+    (data.sections||[]).forEach(section=>{pieces.push(`<h2>${escapeHtml(section.title)}</h2>${rowsToTable(section.rows||[])}`);});
+    $("batchImportResult").innerHTML=pieces.join("");
+    state.airfoils=await getJson("/api/airfoils");
+    renderAirfoilList();
+    if(state.selectedAirfoil)await loadVersionData();
+  }catch(e){
+    $("batchImportResult").textContent=`Batch import failed: ${e.error||e.message||"unknown error"}`;
+  }
+}
+function loadBulkImportScenario(){$("transactionSqlInput").value=`INSERT INTO performance_records
+(perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+VALUES
+(9000001, 'ag03', 1, 0, 123456, 0.5, 0.01, 0.0, 'generated_synthetic', 0);
+
+INSERT INTO performance_records
+(perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
+VALUES
+(9000002, 'ag03', 1, 99, 123456, 0.6, 0.02, 0.0, 'generated_synthetic', 0);
+
+SELECT perf_id, airfoil_id, alpha_deg, reynolds_number, cl, cd
+FROM performance_records
+WHERE perf_id IN (9000001, 9000002);`;$("transactionResult").textContent="场景2已填入：建议点击“执行并提交”，第二条 INSERT 会违反 alpha_deg CHECK，整批回滚。";}
+function loadVersionAtomicScenario(){$("transactionSqlInput").value=`UPDATE airfoils
+SET airfoil_id = 'ag03_txn'
+WHERE airfoil_id = 'ag03';
+
+UPDATE data_versions
+SET version_type = 'bad_version_type'
+WHERE airfoil_id = 'ag03_txn' AND version_id = 1;
+
+SELECT a.airfoil_id AS airfoil_pk, v.airfoil_id AS version_fk, v.version_id, v.version_type
+FROM airfoils a
+JOIN data_versions v ON v.airfoil_id = a.airfoil_id
+WHERE a.airfoil_id IN ('ag03', 'ag03_txn') AND v.version_id = 1;`;$("transactionResult").textContent="场景3已填入：建议点击“执行并提交”。第一条 UPDATE 修改 airfoils.airfoil_id，并通过 ON UPDATE CASCADE 级联到版本表；第二条 UPDATE 违反 version_type CHECK，因此整个事务回滚。";}
+function renderSavedTransactions(){
+  const select=$("savedTransactionSelect");
+  select.innerHTML=state.savedTransactions.map(r=>`<option value="${r.saved_id}">${escapeHtml(r.title)}</option>`).join("")||`<option value="">No saved transactions</option>`;
+}
+async function refreshSavedTransactions(){
+  if(!state.currentUser){state.savedTransactions=[];renderSavedTransactions();return;}
+  try{
+    state.savedTransactions=await getJson("/api/saved_transactions");
+    renderSavedTransactions();
+  }catch(e){
+    state.savedTransactions=[];
+    renderSavedTransactions();
+    $("transactionResult").textContent=`Load saved transactions failed: ${e.error||e.message||"unknown error"}`;
+  }
+}
+async function saveCurrentTransaction(){
+  try{
+    const title=$("savedTransactionTitle").value.trim();
+    const data=await postJson("/api/saved_transactions/save",{title,sql:$("transactionSqlInput").value});
+    $("transactionResult").textContent=`Saved transaction: ${data.title}`;
+    await refreshSavedTransactions();
+    $("savedTransactionSelect").value=String(data.saved_id);
+  }catch(e){
+    $("transactionResult").textContent=`Save transaction failed: ${e.error||"unknown error"}`;
+  }
+}
+function loadSelectedSavedTransaction(){
+  const id=Number($("savedTransactionSelect").value||0);
+  const item=state.savedTransactions.find(r=>Number(r.saved_id)===id);
+  if(!item){$("transactionResult").textContent="No saved transaction selected.";return;}
+  $("savedTransactionTitle").value=item.title;
+  $("transactionSqlInput").value=item.sql_text;
+  $("transactionResult").textContent=`Loaded transaction: ${item.title}`;
+}
+async function deleteSelectedSavedTransaction(){
+  try{
+    const id=Number($("savedTransactionSelect").value||0);
+    if(!id){$("transactionResult").textContent="No saved transaction selected.";return;}
+    await postJson("/api/saved_transactions/delete",{saved_id:id});
+    $("transactionResult").textContent="Deleted saved transaction.";
+    $("savedTransactionTitle").value="";
+    await refreshSavedTransactions();
+  }catch(e){
+    $("transactionResult").textContent=`Delete transaction failed: ${e.error||"unknown error"}`;
+  }
+}
+async function runConcurrencyScenario(){try{$("transactionResult").textContent="并发实验运行中：User A 持有行锁约 2 秒，User B 会等待...";const d=await postJson("/api/transaction_experiment/concurrency",{perf_id:9100001});const pieces=[`<div class="status">Status=${d.status} · perf_id=${d.perf_id} · Time=${d.elapsed_ms} ms</div><h2>Timeline</h2>${rowsToTable(d.steps)}`];if(d.errors&&d.errors.length){pieces.push(`<h2>Errors</h2>${rowsToTable(d.errors.map(x=>({error:x})))}`);}pieces.push(`<h2>Final Record</h2>${rowsToTable(d.final_rows)}`);$("transactionResult").innerHTML=pieces.join("");}catch(e){$("transactionResult").textContent=`Concurrency experiment failed: ${e.error||"unknown error"}`;}}
+async function runTransaction(mode){try{const d=await postJson("/api/transaction_experiment/run",{sql:$("transactionSqlInput").value,mode});const pieces=[`<div class="status">Status=${d.status} · Statements=${d.statement_count} · Time=${d.elapsed_ms} ms</div>`];d.results.forEach(r=>{pieces.push(`<h2>Step ${r.step} · ${escapeHtml(r.type)} · ${r.elapsed_ms} ms</h2><div class="status">${escapeHtml(r.sql)}</div>`);if(r.rows&&r.rows.length){pieces.push(rowsToTable(r.rows));}else{pieces.push(`<div class="status">Affected rows: ${r.affected_rows??0}</div>`);}});$("transactionResult").innerHTML=pieces.join("");if(mode==="commit"){state.airfoils=await getJson("/api/airfoils");renderAirfoilList();if(state.selectedAirfoil)selectAirfoil(state.selectedAirfoil);}}catch(e){const partial=e.results&&e.results.length?`<h2>Partial Results</h2>${e.results.map(r=>`<div class="status">Step ${r.step}: ${escapeHtml(r.type)} · affected ${r.affected_rows??0}</div>`).join("")}`:"";$("transactionResult").innerHTML=`Transaction failed: ${escapeHtml(e.error||"unknown error")}<br>Status: ${escapeHtml(e.status||"rolled back")}${partial}`;}}
+async function runDbObjectExperiment(scenario){
+  try{
+    $("dbObjectResult").textContent="Running database object experiment...";
+    document.querySelectorAll(".dbObjectBtn").forEach(b=>b.classList.toggle("primary",b.dataset.scenario===scenario));
+    const d=await postJson("/api/db_object_experiment/run",{scenario});
+    const pieces=[`<div class="status">Scenario=${escapeHtml(d.scenario)} · Time=${d.elapsed_ms} ms</div>`];
+    (d.sections||[]).forEach(section=>{
+      pieces.push(`<h2>${escapeHtml(section.title)}</h2>`);
+      if(section.note){pieces.push(`<div class="status">${escapeHtml(section.note)}</div>`);}
+      pieces.push(rowsToTable(section.rows||[]));
+    });
+    $("dbObjectResult").innerHTML=pieces.join("");
+    state.airfoils=await getJson("/api/airfoils");
+    renderAirfoilList();
+    if(state.selectedAirfoil)selectAirfoil(state.selectedAirfoil);
+  }catch(e){
+    $("dbObjectResult").textContent=`Experiment failed: ${e.error||"unknown error"}`;
+  }
+}
+function renderAirfoilList(){const q=$("search").value.trim().toLowerCase();const list=$("airfoilList");list.innerHTML="";state.airfoils.filter(r=>!q||r.airfoil_id.toLowerCase().includes(q)||r.name.toLowerCase().includes(q)).forEach(r=>{const b=document.createElement("button");b.className="item"+(state.selectedAirfoil===r.airfoil_id?" active":"");b.innerHTML=`<div><strong>${r.airfoil_id} · ${r.name}</strong><span>${r.final_point_count} points · ${r.performance_count} perf</span></div><div class="badge">${r.anomaly_count}</div>`;b.onclick=()=>selectAirfoil(r.airfoil_id);list.appendChild(b);});}
+async function selectAirfoil(id){
+  state.selectedAirfoil=id;
+  renderAirfoilList();
+  const data=await getJson(`/api/airfoils/${encodeURIComponent(id)}`);
+  state.versions=data.versions||[];
+  const a=data.airfoil;
+  $("airfoilTitle").textContent=`${a.airfoil_id} · ${a.name}`;
+  $("airfoilMeta").textContent=`${a.source_type} · ${a.source_file} · original ${a.original_point_count}, final ${a.final_point_count}`;
+  $("versionSelect").innerHTML=state.versions.map(v=>`<option value="${v.version_id}">version ${v.version_id} · ${v.version_type}</option>`).join("");
+  if(!state.versions.length){
+    state.coordinates=[];
+    state.performance=[];
+    state.anomalies=[];
+    $("coordStatus").textContent="0 points";
+    $("perfStatus").textContent="0 records";
+    $("anomalyStatus").textContent="0 anomalies";
+    drawShape();drawPerformance();drawCd();drawLd();
+    return;
+  }
+  state.selectedVersion=Number(state.versions[0].version_id);
+  await loadVersionData();
+}
+function syncReSelects(values){
+  const options=values.map(re=>`<option value="${re}">Re ${re.toLocaleString()}</option>`).join("");
+  ["reSelect","cdReSelect","ldReSelect"].forEach(id=>{
+    $(id).innerHTML=options;
+    $(id).value=String(state.selectedRe);
+  });
+}
+function changeSelectedRe(value){
+  state.selectedRe=Number(value);
+  ["reSelect","cdReSelect","ldReSelect"].forEach(id=>$(id).value=String(state.selectedRe));
+  drawPerformance();
+  drawCd();
+  drawLd();
+  scheduleSecondaryCharts();
+}
+async function loadVersionData(){
+  ["shapeTooltip","perfTooltip","cdTooltip","ldTooltip","compareTooltip","versionDiffTooltip"].forEach(hideTooltip);
+  const id=encodeURIComponent(state.selectedAirfoil),v=state.selectedVersion;
+  try{
+    const [coords,perf,anom]=await Promise.all([
+      getJson(`/api/coordinates?airfoil_id=${id}&version_id=${v}`),
+      getJson(`/api/performance?airfoil_id=${id}&version_id=${v}`),
+      getJson(`/api/anomalies?airfoil_id=${id}&version_id=${v}`)
+    ]);
+    state.coordinates=coords;
+    state.performance=perf;
+    state.anomalies=anom;
+    const res=[...new Set(perf.map(r=>Number(r.reynolds_number)))].sort((a,b)=>a-b);
+    state.selectedRe=res.includes(state.selectedRe)?state.selectedRe:(res[0]||50000);
+    syncReSelects(res);
+    $("coordStatus").textContent=`${coords.length} points`;
+    $("perfStatus").textContent=`${perf.length} records`;
+    $("anomalyStatus").textContent=`${anom.length} anomalies`;
+    renderMetrics();renderAnomalies();drawShape();drawPerformance();drawCd();drawLd();scheduleSecondaryCharts();
+  }catch(e){
+    state.coordinates=[];
+    state.performance=[];
+    state.anomalies=[];
+    $("coordStatus").textContent="load failed";
+    $("perfStatus").textContent="load failed";
+    $("anomalyStatus").textContent="load failed";
+    drawShape();drawPerformance();drawCd();drawLd();
+    console.error(e);
+    alert(`翼型详情加载失败：${e.error||e.message||"unknown error"}`);
+  }
+}
+function renderMetrics(){const cls=state.performance.map(r=>Number(r.cl));const cds=state.performance.map(r=>Number(r.cd));const ac=state.performance.filter(r=>Number(r.is_anomaly)===1).length;$("metrics").innerHTML=`<div class="metric"><b>${state.coordinates.length}</b><span>坐标点</span></div><div class="metric"><b>${num(Math.max(...cls),3)}</b><span>最大 CL</span></div><div class="metric"><b>${num(Math.min(...cds),5)}</b><span>最小 CD</span></div><div class="metric"><b>${state.performance.length}</b><span>性能记录</span></div><div class="metric"><b>${ac}</b><span>异常标记</span></div><div class="metric"><b>${state.selectedVersion}</b><span>局部版本号</span></div>`;}
+function renderAnomalies(){const body=$("anomalyRows");body.innerHTML=state.anomalies.map(r=>`<tr><td>${r.anomaly_id}</td><td class="danger">${r.rule_type}</td><td>${r.alpha_deg}</td><td>${Number(r.reynolds_number).toLocaleString()}</td><td>${num(r.cl,3)}</td><td>${num(r.cd,5)}</td></tr>`).join("")||`<tr><td colspan="6">当前翼型版本没有异常记录</td></tr>`;}
+async function refreshIndexStatus(){const d=await getJson("/api/index_experiment/status");$("indexStatus").textContent=d.exists?"idx exists":"idx missing";}
+async function loadIndexTables(){const tables=await getJson("/api/index_experiment/tables");$("indexTableSelect").innerHTML=tables.map(t=>`<option value="${t}" ${t==="performance_records"?"selected":""}>${t}</option>`).join("");await loadIndexColumns();}
+async function loadIndexColumns(){const table=$("indexTableSelect").value;const cols=await getJson(`/api/index_experiment/columns?table=${encodeURIComponent(table)}`);$("indexColumnBox").innerHTML=cols.map(c=>`<label class="status"><input type="checkbox" class="indexColumnCheck" value="${c}"> ${c}</label>`).join("");await loadIndexes();}
+function selectedIndexColumns(){return Array.from(document.querySelectorAll(".indexColumnCheck:checked")).map(x=>x.value);}
+function renderIndexTable(rows){
+  if(!rows||!rows.length)return "<div class='status'>当前表没有索引记录。</div>";
+  const cols=Object.keys(rows[0]);
+  return `<div class="tableWrap"><table><thead><tr><th>操作</th>${cols.map(c=>`<th>${escapeHtml(c)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr><td><button class="action rowDeleteBtn indexRowDeleteBtn" title="删除索引" data-index="${escapeHtml(r.index_name||"")}">×</button></td>${cols.map(c=>`<td>${escapeHtml(r[c])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+function attachIndexRowDeleteActions(){
+  document.querySelectorAll(".indexRowDeleteBtn").forEach(btn=>btn.addEventListener("click",()=>{
+    dropIndex(btn.dataset.index||"");
+  }));
+}
+function showIndexForm(mode){
+  $("indexForm").classList.add("visible");
+  $("indexForm").dataset.mode=mode;
+  const isCreate=mode==="create";
+  $("indexFormHint").textContent="选择属性，输入索引名后创建索引。";
+  $("indexColumnBox").style.display=isCreate?"block":"none";
+  $("createIndexBtn").style.display="inline-flex";
+}
+async function loadIndexes(){try{const table=$("indexTableSelect").value||"performance_records";const rows=await getJson(`/api/index_experiment/indexes?table=${encodeURIComponent(table)}`);$("indexList").innerHTML=renderIndexTable(rows);attachIndexRowDeleteActions();}catch(e){$("indexList").textContent=e.message||String(e);}}
+async function createIndex(){try{const payload={table:$("indexTableSelect").value,index_name:$("indexNameInput").value.trim(),columns:selectedIndexColumns()};const data=await postJson("/api/index_experiment/create",payload);await refreshIndexStatus();await loadIndexes();$("indexList").insertAdjacentHTML("afterbegin",`<div class="status">Created ${escapeHtml(data.index_name)} on ${escapeHtml(data.table)}(${data.columns.map(escapeHtml).join(", ")}).</div>`);}catch(e){$("indexList").textContent=e.error||"create failed";}}
+async function dropIndex(indexName){try{const table=$("indexTableSelect").value;if(!indexName)return;if(!confirm(`删除 ${table}.${indexName} ?`))return;const data=await postJson("/api/index_experiment/drop",{table,index_name:indexName});await refreshIndexStatus();await loadIndexes();$("indexList").insertAdjacentHTML("afterbegin",`<div class="status">Dropped ${escapeHtml(data.index_name)} on ${escapeHtml(data.table)}.</div>`);}catch(e){$("indexList").textContent=e.error||"drop failed";}}
+async function runIndex(){try{const d=await postJson("/api/index_experiment/run_sql",{sql:$("indexSqlInput").value});$("indexResult").innerHTML=`<div class="status">Rows=${d.row_count} · Time=${d.elapsed_ms} ms · showing first ${d.rows.length}</div><h2>Result</h2>${rowsToTable(d.rows)}<h2>EXPLAIN</h2>${rowsToTable(d.explain)}`;}catch(e){$("indexResult").textContent=`Experiment failed: ${e.error||"unknown error"}`;}}
+function setupCanvas(canvas){const rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;canvas.width=Math.max(1,Math.floor(rect.width*dpr));canvas.height=Math.max(1,Math.floor(rect.height*dpr));const ctx=canvas.getContext("2d");ctx.setTransform(dpr,0,0,dpr,0,0);return{ctx,width:rect.width,height:rect.height};}
+function axisFmt(value){
+  const n=Number(value);
+  if(!Number.isFinite(n))return "";
+  const abs=Math.abs(n);
+  if(abs>=1000)return n.toFixed(0);
+  if(abs>=10)return n.toFixed(1);
+  if(abs>=1)return n.toFixed(2);
+  return n.toFixed(3);
+}
+function drawAxes(ctx,w,h,xMin=null,xMax=null,yMin=null,yMax=null){
+  const left=52,right=30,top=20,bottom=42;
+  const plotW=w-left-right,plotH=h-top-bottom;
+  ctx.strokeStyle="#e1e6ef";
+  ctx.lineWidth=1;
+  ctx.font="11px Consolas";
+  ctx.fillStyle="#62708a";
+  ctx.textAlign="center";
+  ctx.textBaseline="top";
+  for(let i=0;i<=5;i++){
+    const x=left+plotW*i/5;
+    ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,top+plotH);ctx.stroke();
+    if(xMin!==null&&xMax!==null){
+      ctx.fillText(axisFmt(xMin+(xMax-xMin)*i/5),x,top+plotH+7);
+    }
+  }
+  ctx.textAlign="right";
+  ctx.textBaseline="middle";
+  for(let i=0;i<=4;i++){
+    const y=top+plotH*i/4;
+    ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(left+plotW,y);ctx.stroke();
+    if(yMin!==null&&yMax!==null){
+      ctx.fillText(axisFmt(yMax-(yMax-yMin)*i/4),left-7,y);
+    }
+  }
+  ctx.textAlign="left";
+  ctx.textBaseline="alphabetic";
+  return{left,right,top,bottom,plotW,plotH};
+}
+function nearestPoint(points,x,y,maxDist=28){let best=null,bestD=maxDist*maxDist;points.forEach(p=>{const d=(p.sx-x)**2+(p.sy-y)**2;if(d<bestD){best=p;bestD=d;}});return best;}
+function showTooltip(id,canvas,x,y,html){const tip=$(id),section=canvas.closest("section"),srect=section.getBoundingClientRect();tip.innerHTML=html;tip.style.display="block";let left=canvas.offsetLeft+x+14,top=canvas.offsetTop+y+14;if(left+tip.offsetWidth>srect.width)left=canvas.offsetLeft+x-tip.offsetWidth-14;if(top+tip.offsetHeight>srect.height)top=canvas.offsetTop+y-tip.offsetHeight-14;tip.style.left=`${Math.max(8,left)}px`;tip.style.top=`${Math.max(8,top)}px`;}
+function hideTooltip(id){$(id).style.display="none";}
+function handleShapeHover(e){const canvas=$("shapeCanvas"),rect=canvas.getBoundingClientRect(),p=nearestPoint(state.shapeScreen,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip("shapeTooltip");return;}showTooltip("shapeTooltip",canvas,p.sx,p.sy,`point_order: ${p.point_order}<br>x: ${num(p.x,5)}<br>y: ${num(p.y,5)}<br>surface: ${escapeHtml(p.surface)}<br>source: ${escapeHtml(p.point_source)}`);}
+function handlePerfHover(e){const canvas=$("perfCanvas"),rect=canvas.getBoundingClientRect(),p=nearestPoint(state.perfScreen,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip("perfTooltip");return;}showTooltip("perfTooltip",canvas,p.sx,p.sy,`alpha: ${num(p.alpha_deg,2)} deg<br>Re: ${Number(p.reynolds_number).toLocaleString()}<br>CL: ${num(p.cl,4)}<br>CD: ${num(p.cd,5)}<br>CM: ${num(p.cm,4)}${Number(p.is_anomaly)===1?"<br>anomaly: yes":""}`);}
+function handleSeriesHover(e,canvasId,tipId,points){const canvas=$(canvasId),rect=canvas.getBoundingClientRect(),p=nearestPoint(points,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip(tipId);return;}showTooltip(tipId,canvas,p.sx,p.sy,`${escapeHtml(p.label||"point")}<br>alpha: ${num(p.alpha_deg,2)} deg<br>value: ${num(p.value,5)}<br>Re: ${Number(p.reynolds_number).toLocaleString()}`);}
+function handleCompareHover(e){const canvas=$("compareCanvas"),rect=canvas.getBoundingClientRect(),x=e.clientX-rect.left,y=e.clientY-rect.top;const p=state.compareScreen.find(b=>x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h);if(!p){hideTooltip("compareTooltip");return;}showTooltip("compareTooltip",canvas,p.x+p.w/2,p.y,`${escapeHtml(p.airfoil_id)}<br>${escapeHtml(p.name)}<br>${escapeHtml(state.compareMetric)}: ${num(p.value,5)}`);}
+function drawLineSeries(canvasId,rows,valueFn,screenKey,label){const {ctx,width:w,height:h}=setupCanvas($(canvasId));ctx.clearRect(0,0,w,h);state[screenKey]=[];const pts=rows.filter(r=>Number.isFinite(valueFn(r))).map(r=>({...r,alpha_deg:Number(r.alpha_deg),reynolds_number:Number(r.reynolds_number),value:valueFn(r),label}));if(!pts.length){drawAxes(ctx,w,h);return;}const minA=Math.min(...pts.map(r=>r.alpha_deg)),maxA=Math.max(...pts.map(r=>r.alpha_deg)),minV=Math.min(...pts.map(r=>r.value)),maxV=Math.max(...pts.map(r=>r.value));const ax=drawAxes(ctx,w,h,minA,maxA,minV,maxV);const sx=x=>ax.left+(x-minA)/(maxA-minA||1)*ax.plotW,sy=y=>ax.top+ax.plotH-(y-minV)/(maxV-minV||1)*ax.plotH;ctx.strokeStyle="#1f766f";ctx.lineWidth=2;ctx.beginPath();pts.forEach((r,i)=>{const px=sx(r.alpha_deg),py=sy(r.value);state[screenKey].push({...r,sx:px,sy:py});if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);});ctx.stroke();state[screenKey].forEach(r=>{ctx.fillStyle=Number(r.is_anomaly)===1?"#b42318":"#1f766f";ctx.beginPath();ctx.arc(r.sx,r.sy,3,0,Math.PI*2);ctx.fill();});}
+function drawCd(){const rows=state.performance.filter(r=>Number(r.reynolds_number)===state.selectedRe);drawLineSeries("cdCanvas",rows,r=>Number(r.cd),"cdScreen","CD-alpha");}
+function drawLd(){const rows=state.performance.filter(r=>Number(r.reynolds_number)===state.selectedRe);drawLineSeries("ldCanvas",rows,r=>Number(r.cd)?Number(r.cl)/Number(r.cd):NaN,"ldScreen","CL/CD-alpha");}
+async function drawCompare(){
+  const {ctx,width:w,height:h}=setupCanvas($("compareCanvas"));
+  ctx.clearRect(0,0,w,h);
+  state.compareScreen=[];
+  const re=Number($("compareReSelect").value||50000);
+  let rows=[];
+  try{
+    rows=await getJson(`/api/performance_compare?reynolds_number=${re}&metric=${encodeURIComponent(state.compareMetric)}`);
+  }catch(e){
+    drawAxes(ctx,w,h);
+    ctx.fillStyle="#b42318";
+    ctx.font="13px Consolas";
+    ctx.fillText(`compare load failed: ${String(e.error||e.message||"unknown error").slice(0,90)}`,60,42);
+    return;
+  }
+  rows=rows.map(r=>({...r,value:Number(r.value)})).filter(r=>Number.isFinite(r.value)).slice(0,12);
+  if(!rows.length){
+    drawAxes(ctx,w,h);
+    ctx.fillStyle="#62708a";
+    ctx.font="13px Consolas";
+    ctx.fillText("No comparable performance records for this Re.",60,42);
+    return;
+  }
+
+  const labelX=24,barX=178,top=20,bottom=54,right=40;
+  const plotW=Math.max(120,w-barX-right);
+  const rowH=Math.max(18,(h-top-bottom)/rows.length);
+  const barH=Math.min(18,rowH*0.58);
+  const values=rows.map(r=>r.value);
+  const minV=Math.min(0,...values),maxV=Math.max(...values);
+  const scale=v=>(v-minV)/(maxV-minV||1)*plotW;
+  const baseline=barX+scale(0);
+
+  ctx.strokeStyle="#e7ebf2";
+  ctx.lineWidth=1;
+  ctx.font="12px Consolas";
+  ctx.fillStyle="#62708a";
+  for(let i=0;i<=4;i++){
+    const x=barX+plotW*i/4;
+    ctx.beginPath();ctx.moveTo(x,top-8);ctx.lineTo(x,h-bottom);ctx.stroke();
+    const tick=minV+(maxV-minV)*i/4;
+    ctx.textAlign="center";
+    ctx.fillText(num(tick,2),x,h-18);
+  }
+  ctx.strokeStyle="#9aa7bb";
+  ctx.beginPath();ctx.moveTo(baseline,top-8);ctx.lineTo(baseline,h-bottom);ctx.stroke();
+  ctx.textAlign="left";
+
+  rows.forEach((r,i)=>{
+    const y=top+i*rowH+rowH/2;
+    const value=r.value;
+    const x0=value>=0?baseline:barX+scale(value);
+    const x1=value>=0?barX+scale(value):baseline;
+    const barW=Math.max(2,Math.abs(x1-x0));
+    const airfoil=String(r.airfoil_id||"");
+    const label=airfoil.length>18?`${airfoil.slice(0,17)}…`:airfoil;
+
+    ctx.fillStyle=i===0?"#1f766f":"#2d8a82";
+    ctx.fillRect(x0,y-barH/2,barW,barH);
+    ctx.fillStyle="#172033";
+    ctx.font="600 12px Consolas";
+    ctx.fillText(label,labelX,y+4);
+    ctx.font="12px Consolas";
+    ctx.fillStyle="#44536a";
+    const valueText=num(value,state.compareMetric==="min_cd"?5:3);
+    const tx=value>=0?Math.min(x0+barW+6,w-88):Math.max(x0-54,barX);
+    ctx.fillText(valueText,tx,y+4);
+    state.compareScreen.push({...r,value,x:x0,y:y-barH/2,w:barW,h:barH});
+  });
+}
+function scheduleSecondaryCharts(){clearTimeout(state.secondaryChartTimer);state.secondaryChartTimer=setTimeout(()=>{if($("pageOverview").classList.contains("active")){drawCompare();drawVersionDiff();}},250);}
+async function drawVersionDiff(){
+  const {ctx,width:w,height:h}=setupCanvas($("versionDiffCanvas"));
+  ctx.clearRect(0,0,w,h);
+  state.versionDiffScreen=[];
+  const re=Number(state.selectedRe||$("compareReSelect").value||50000);
+  let rows=[];
+  try{
+    rows=await getJson(`/api/version_compare?reynolds_number=${re}`);
+  }catch(e){return;}
+  rows=rows.map(r=>({...r,value:Number(r.value)})).filter(r=>Number.isFinite(r.value)).slice(0,14);
+  $("versionDiffStatus").textContent=`Re ${Number(re).toLocaleString()} · 全库版本最大 CL/CD 对比`;
+  if(!rows.length){
+    drawAxes(ctx,w,h);
+    ctx.fillStyle="#62708a";
+    ctx.font="14px Segoe UI";
+    ctx.fillText("No version performance records at this Reynolds number.",44,44);
+    return;
+  }
+
+  const labelX=24,barX=210,top=20,bottom=54,right=40;
+  const plotW=Math.max(120,w-barX-right);
+  const rowH=Math.max(18,(h-top-bottom)/rows.length);
+  const barH=Math.min(16,rowH*0.58);
+  const maxV=Math.max(...rows.map(r=>r.value))||1;
+
+  ctx.strokeStyle="#e7ebf2";
+  ctx.lineWidth=1;
+  ctx.font="12px Consolas";
+  ctx.fillStyle="#62708a";
+  for(let i=0;i<=4;i++){
+    const x=barX+plotW*i/4;
+    ctx.beginPath();ctx.moveTo(x,top-8);ctx.lineTo(x,h-bottom);ctx.stroke();
+    ctx.textAlign="center";
+    ctx.fillText(num(maxV*i/4,2),x,h-18);
+  }
+  ctx.textAlign="left";
+
+  rows.forEach((r,i)=>{
+    const y=top+i*rowH+rowH/2;
+    const value=r.value;
+    const barW=Math.max(2,value/maxV*plotW);
+    const rawLabel=`${r.airfoil_id} v${r.version_id}`;
+    const label=rawLabel.length>22?`${rawLabel.slice(0,21)}…`:rawLabel;
+    ctx.fillStyle=r.version_type==="augmented_from_raw"?"#b25d2a":"#1f766f";
+    ctx.fillRect(barX,y-barH/2,barW,barH);
+    ctx.fillStyle="#172033";
+    ctx.font="600 12px Consolas";
+    ctx.fillText(label,labelX,y+4);
+    ctx.font="12px Consolas";
+    ctx.fillStyle="#44536a";
+    ctx.fillText(num(value,3),Math.min(barX+barW+6,w-88),y+4);
+    state.versionDiffScreen.push({...r,label:rawLabel,value,x:barX,y:y-barH/2,w:barW,h:barH});
+  });
+}
+function drawShape(){const {ctx,width:w,height:h}=setupCanvas($("shapeCanvas"));ctx.clearRect(0,0,w,h);const pts=state.coordinates.map(p=>({...p,x:Number(p.x),y:Number(p.y)}));state.shapeScreen=[];if(!pts.length){drawAxes(ctx,w,h);return;}const minX=Math.min(...pts.map(p=>p.x)),maxX=Math.max(...pts.map(p=>p.x)),minY=Math.min(...pts.map(p=>p.y)),maxY=Math.max(...pts.map(p=>p.y));const ax=drawAxes(ctx,w,h,minX,maxX,minY,maxY);const sx=x=>ax.left+(x-minX)/(maxX-minX||1)*ax.plotW,sy=y=>ax.top+ax.plotH-(y-minY)/(maxY-minY||1)*ax.plotH;ctx.strokeStyle="#1f766f";ctx.lineWidth=2;ctx.beginPath();pts.forEach((p,i)=>{const px=sx(p.x),py=sy(p.y);state.shapeScreen.push({...p,sx:px,sy:py});if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);});ctx.stroke();state.shapeScreen.forEach((p,i)=>{if(i%10===0||p.point_source==="augmented"){ctx.fillStyle=p.point_source==="augmented"?"#b25d2a":"#1f766f";ctx.beginPath();ctx.arc(p.sx,p.sy,p.point_source==="augmented"?3:2,0,Math.PI*2);ctx.fill();}});}
+function drawPerformance(){const {ctx,width:w,height:h}=setupCanvas($("perfCanvas"));ctx.clearRect(0,0,w,h);const rows=state.performance.filter(r=>Number(r.reynolds_number)===state.selectedRe).map(r=>({...r,a:Number(r.alpha_deg),cln:Number(r.cl),anom:Number(r.is_anomaly)===1}));state.perfScreen=[];if(!rows.length){drawAxes(ctx,w,h);return;}const minA=Math.min(...rows.map(r=>r.a)),maxA=Math.max(...rows.map(r=>r.a)),minC=Math.min(...rows.map(r=>r.cln)),maxC=Math.max(...rows.map(r=>r.cln));const ax=drawAxes(ctx,w,h,minA,maxA,minC,maxC);const sx=x=>ax.left+(x-minA)/(maxA-minA||1)*ax.plotW,sy=y=>ax.top+ax.plotH-(y-minC)/(maxC-minC||1)*ax.plotH;ctx.strokeStyle="#1f766f";ctx.lineWidth=2;ctx.beginPath();rows.forEach((r,i)=>{const px=sx(r.a),py=sy(r.cln);state.perfScreen.push({...r,sx:px,sy:py});if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);});ctx.stroke();state.perfScreen.forEach(r=>{ctx.fillStyle=r.anom?"#b42318":"#1f766f";ctx.beginPath();ctx.arc(r.sx,r.sy,r.anom?4:3,0,Math.PI*2);ctx.fill();});}
+init().catch(err=>{$("summary").textContent="Frontend failed. Check Flask/MySQL.";console.error(err);});
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    app.run(
+        host=os.getenv("FLASK_HOST", "127.0.0.1"),
+        port=int(os.getenv("FLASK_PORT", "5000")),
+        debug=os.getenv("FLASK_DEBUG", "0") == "1",
+    )
+
+
+
+

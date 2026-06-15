@@ -1,0 +1,71 @@
+airfoil_id,name,source,family,is_generated,source_type,source_file,has_augmented_coordinates,original_point_count,final_point_count
+ag03,AG03 (flat aft bottom),UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag03.dat,0,180,180
+ag04,AG04,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag04.dat,0,180,180
+ag08,AG08,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag08.dat,0,180,180
+ag09,AG09,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag09.dat,0,180,180
+ag10,AG10,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag10.dat,0,180,180
+ag11,AG11,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag11.dat,0,183,183
+ag12,AG12,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag12.dat,0,160,160
+ag13,AG13,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag13.dat,0,160,160
+ag14,AG14,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag14.dat,0,160,160
+ag16,AG16,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\ag16.dat,0,160,160
+aquilasm,AQUILA 9.3% smoothed,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\aquilasm.dat,1,69,120
+b737a,BOEING 737 ROOT AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\b737a.dat,1,45,120
+b737b,BOEING 737 MIDSPAN AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\b737b.dat,1,45,120
+b737c,BOEING 737 MIDSPAN AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\b737c.dat,1,45,120
+b737d,BOEING 737 OUTBOARD AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\b737d.dat,1,45,120
+clarky,CLARK Y AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\clarky.dat,0,121,121
+clarkyh,CLARK YH AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\clarkyh.dat,1,31,120
+clarkysm,CLARK-Y 11.7% smoothed,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\clarkysm.dat,1,69,120
+dae11,DAE-11 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\dae11.dat,0,81,81
+du8608418,DU86-084/18 8.44%,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\du8608418.dat,0,101,101
+e193,E193  (10.22%),UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\e193.dat,1,61,120
+e205,E205  (10.48%),UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\e205.dat,1,61,120
+e374,E374,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\e374.dat,1,61,120
+e387,E387,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\e387.dat,1,61,120
+e392,E392  (10.15%),UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\e392.dat,1,61,120
+e593,EPPLER 593 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\e593.dat,1,71,120
+e664,EPPLER 664 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\e664.dat,1,61,120
+fx60126,WORTMANN FX 60-126 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\fx60126.dat,0,97,97
+fx61184,FX 61-184 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\fx61184.dat,0,97,97
+fx63137,WORTMANN FX 63-137 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\fx63137.dat,0,97,97
+fx66196v,FX 66-S-196 V1 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\fx66196v.dat,0,87,87
+fx67k150,FX 67-K-150/17 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\fx67k150.dat,0,87,87
+fx71l150,FX 71-L-150/30 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\fx71l150.dat,0,87,87
+fx74cl5140,FX74_CL5_140,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\fx74cl5140.dat,0,87,87
+fx79k144,WORTMANN FX 79-K-144/17 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\fx79k144.dat,0,97,97
+goe398,GOE 398 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\goe398.dat,1,33,120
+l1003,LIEBECK L1003 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\l1003.dat,1,49,120
+lrn1015,NASA LRN 1015 (NASA TM 102840),UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\lrn1015.dat,1,79,120
+mh114,MH 114  13.02%,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\mh114.dat,1,68,120
+mh32,MH 32  8.7%,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\mh32.dat,1,68,120
+mh45,MH 45  9.85%,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\mh45.dat,1,67,120
+n0009sm,NACA-0009 9.0% smoothed,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\n0009sm.dat,1,69,120
+n0012,NACA 0012 AIRFOILS,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\n0012.dat,0,131,131
+n63212,NACA 63-212 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\n63212.dat,1,51,120
+n64212,NACA 64(1)-212,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\n64212.dat,1,51,120
+naca0006,NACA 0006,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca0006.dat,1,35,120
+naca0015,NACA 0015,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca0015.dat,1,35,120
+naca0018,NACA 0018,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca0018.dat,1,35,120
+naca23012,NACA 23012  12%,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca23012.dat,1,61,120
+naca23015,NACA 23015,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca23015.dat,1,35,120
+naca23018,NACA 23018,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca23018.dat,1,35,120
+naca23021,NACA 23021,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca23021.dat,1,35,120
+naca2412,NACA 2412,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca2412.dat,1,35,120
+naca2415,NACA 2415,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca2415.dat,1,35,120
+naca4412,NACA 4412,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca4412.dat,1,35,120
+naca4415,NACA 4415,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\naca4415.dat,0,97,97
+naca6412,NACA 6412,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\naca6412.dat,1,62,120
+raf15,RAF 15 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\raf15.dat,1,31,120
+raf19,RAF 19 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\raf19.dat,1,33,120
+rg14,RG 14 AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\rg14.dat,1,62,120
+rg15,RG-15 8.9%,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\rg15.dat,1,62,120
+s1223,S1223,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\s1223.dat,0,81,81
+s3010,S3010-103-84,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\s3010.dat,1,61,120
+s3021,S3021-095-84,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\s3021.dat,1,61,120
+s4061,S4061-096-84,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\s4061.dat,1,61,120
+s8052,S8052 (11.88%),UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw,data\s8052.dat,0,81,81
+sd7003,SD7003-085-88,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\sd7003.dat,1,61,120
+sd7037,SD7037-092-88,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\sd7037.dat,1,61,120
+sm701,SM701,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\sm701.dat,1,61,120
+tsagi12,TsAGI 12% AIRFOIL,UIUC Airfoil Coordinates Database,UIUC,0,uiuc_raw_with_tracked_augmentation,data\tsagi12.dat,1,33,120

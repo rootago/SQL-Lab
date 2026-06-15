@@ -1,0 +1,23 @@
+UIUC .dat processing report
+airfoil_count=70
+coordinate_count=8552
+augmented_coordinate_count=3054
+performance_count=4200
+anomaly_count=39
+reynolds_numbers=50000,100000,200000,500000
+alpha_degrees=-10,-8,-6,-4,-2,0,2,4,6,8,10,12,14,16,18
+
+Notes:
+- Coordinates marked real come from the .dat file's original coordinate rows.
+- Coordinates marked augmented are inserted interpolation points already labelled in data/*.dat.
+- Performance records are generated for database-course experiments and are not CFD or wind-tunnel data.
+- Anomaly rows are intentionally injected and tracked in anomalies.csv.
+
+
+Weak-entity version conversion
+output_directory=output_uiuc_dat_weak_version
+version_id_conversion=old string IDs such as ag03_v1 are split into airfoil_id=ag03 and version_id=1
+data_versions_primary_key=(airfoil_id, version_id)
+coordinate_points_foreign_key=(airfoil_id, version_id) -> data_versions(airfoil_id, version_id)
+performance_records_foreign_key=(airfoil_id, version_id) -> data_versions(airfoil_id, version_id)
+original_output_directory=output_uiuc_dat remains unchanged.
