@@ -713,7 +713,6 @@ BATCH_IMPORT_COLUMNS = {
         "source_type",
         "is_anomaly",
     ],
-    "anomaly_records": ["anomaly_id", "perf_id", "airfoil_id", "version_id", "rule_type", "detail"],
 }
 
 BATCH_IMPORT_INT_COLUMNS = {
@@ -728,7 +727,6 @@ BATCH_IMPORT_INT_COLUMNS = {
     "perf_id",
     "reynolds_number",
     "is_anomaly",
-    "anomaly_id",
 }
 
 BATCH_IMPORT_FLOAT_COLUMNS = {"x", "y", "alpha_deg", "cl", "cd", "cm"}
@@ -2311,9 +2309,27 @@ def validate_batch_payload(payload: dict[str, Any]) -> tuple[str, str, list[str]
     return table_name, batch_id, expected, rows
 
 
+def remap_batch_integer_primary_keys(table_name: str, id_column: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    max_rows = query_all(f"SELECT COALESCE(MAX(`{id_column}`), 0) AS max_id FROM `{table_name}`")
+    next_id = int(max_rows[0].get("max_id") or 0) + 1
+    mappings: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        original_id = int(row[id_column])
+        new_id = next_id + index
+        row[id_column] = new_id
+        mappings.append({
+            "row_no": index + 2,
+            "input_id": original_id,
+            "stored_id": new_id,
+            "note": f"{id_column} is treated as a file-local id and remapped to avoid primary-key conflicts",
+        })
+    return mappings
+
+
 def import_generic_batch(table_name: str, batch_id: str, columns: list[str], rows: list[dict[str, Any]], user: dict[str, Any]) -> dict[str, Any]:
     parsed_rows: list[dict[str, Any]] = []
-    values: list[tuple[Any, ...]] = []
     for row_no, row in enumerate(rows, start=2):
         if not isinstance(row, dict):
             raise ValueError(f"line {row_no}: row must be an object")
@@ -2321,7 +2337,11 @@ def import_generic_batch(table_name: str, batch_id: str, columns: list[str], row
             raise ValueError(f"line {row_no}: columns do not match selected table")
         parsed = {column: batch_import_value(table_name, column, row.get(column, "")) for column in columns}
         parsed_rows.append(parsed)
-        values.append(tuple(parsed[column] for column in columns))
+
+    primary_key_remaps: list[dict[str, Any]] = []
+    if table_name == "anomaly_records":
+        primary_key_remaps = remap_batch_integer_primary_keys("anomaly_records", "anomaly_id", parsed_rows)
+    values: list[tuple[Any, ...]] = [tuple(parsed[column] for column in columns) for parsed in parsed_rows]
 
     start = time.perf_counter()
     column_sql = ", ".join(f"`{column}`" for column in columns)
@@ -2363,6 +2383,7 @@ def import_generic_batch(table_name: str, batch_id: str, columns: list[str], row
         "elapsed_ms": elapsed_ms,
         "sections": [
             {"title": "Header validation", "rows": [{"target_table": table_name, "expected_header": ", ".join(columns), "status": "matched"}]},
+            {"title": "Primary key remap", "rows": primary_key_remaps},
             {"title": "Imported rows", "rows": inserted_rows},
         ],
     }
@@ -2376,33 +2397,46 @@ def import_performance_batch(user: dict[str, Any], payload: dict[str, Any]) -> A
     if not isinstance(rows, list) or not rows or len(rows) > MAX_BATCH_IMPORT_ROWS:
         return jsonify({"error": "rows must contain 1-10000 records"}), 400
 
-    parsed_rows: list[tuple[Any, ...]] = []
-    perf_ids: list[int] = []
+    parsed_dicts: list[dict[str, Any]] = []
     try:
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("each row must be an object")
             if set(row.keys()) != set(BATCH_IMPORT_COLUMNS["performance_records"]):
                 raise ValueError("performance_records columns do not match the required header")
-            perf_id = required_int(row, "perf_id")
-            parsed_rows.append(
-                (
-                    batch_id,
-                    perf_id,
-                    str(row.get("airfoil_id", "")).strip(),
-                    required_int(row, "version_id"),
-                    required_float(row, "alpha_deg"),
-                    required_int(row, "reynolds_number"),
-                    required_float(row, "cl"),
-                    required_float(row, "cd"),
-                    required_float(row, "cm"),
-                    str(row.get("source_type", "generated_synthetic")).strip() or "generated_synthetic",
-                    required_int(row, "is_anomaly"),
-                )
-            )
-            perf_ids.append(perf_id)
+            parsed_dicts.append({
+                "perf_id": required_int(row, "perf_id"),
+                "airfoil_id": str(row.get("airfoil_id", "")).strip(),
+                "version_id": required_int(row, "version_id"),
+                "alpha_deg": required_float(row, "alpha_deg"),
+                "reynolds_number": required_int(row, "reynolds_number"),
+                "cl": required_float(row, "cl"),
+                "cd": required_float(row, "cd"),
+                "cm": required_float(row, "cm"),
+                "source_type": str(row.get("source_type", "generated_synthetic")).strip() or "generated_synthetic",
+                "is_anomaly": required_int(row, "is_anomaly"),
+            })
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
+
+    primary_key_remaps = remap_batch_integer_primary_keys("performance_records", "perf_id", parsed_dicts)
+    parsed_rows: list[tuple[Any, ...]] = [
+        (
+            batch_id,
+            row["perf_id"],
+            row["airfoil_id"],
+            row["version_id"],
+            row["alpha_deg"],
+            row["reynolds_number"],
+            row["cl"],
+            row["cd"],
+            row["cm"],
+            row["source_type"],
+            row["is_anomaly"],
+        )
+        for row in parsed_dicts
+    ]
+    perf_ids: list[int] = [int(row["perf_id"]) for row in parsed_dicts]
 
     start = time.perf_counter()
     conn = get_db_connection()
@@ -2481,6 +2515,7 @@ def import_performance_batch(user: dict[str, Any], payload: dict[str, Any]) -> A
             "elapsed_ms": elapsed_ms,
             "sections": [
                 {"title": "Header validation", "rows": [{"target_table": "performance_records", "expected_header": ", ".join(BATCH_IMPORT_COLUMNS["performance_records"]), "status": "matched"}]},
+                {"title": "Primary key remap", "rows": primary_key_remaps},
                 {"title": "Procedure status", "rows": status_rows},
                 {"title": "Rejected rows", "rows": result_sets[1] if len(result_sets) > 1 else []},
                 {"title": "Staging rows", "rows": staged_rows},
@@ -4435,7 +4470,6 @@ WHERE airfoil_id = 'ag03';</textarea>
             <option value="airfoils">airfoils</option>
             <option value="data_versions">data_versions</option>
             <option value="coordinate_points">coordinate_points</option>
-            <option value="anomaly_records">anomaly_records</option>
             <option value="data_sources">data_sources</option>
           </select>
           <input id="batchImportId" placeholder="batch_id" value="ui_batch_001">
@@ -5216,8 +5250,7 @@ const BATCH_HEADERS={
   airfoils:["airfoil_id","name","source","family","is_generated","source_type","source_file","has_augmented_coordinates","original_point_count","final_point_count"],
   data_versions:["airfoil_id","version_id","version_type","coordinate_source_type","description"],
   coordinate_points:["airfoil_id","version_id","point_order","x","y","surface","point_source","is_augmented","original_order","augmentation_method"],
-  performance_records:["perf_id","airfoil_id","version_id","alpha_deg","reynolds_number","cl","cd","cm","source_type","is_anomaly"],
-  anomaly_records:["anomaly_id","perf_id","airfoil_id","version_id","rule_type","detail"]
+  performance_records:["perf_id","airfoil_id","version_id","alpha_deg","reynolds_number","cl","cd","cm","source_type","is_anomaly"]
 };
 const BATCH_SAMPLES={
   good:{
@@ -5231,11 +5264,17 @@ ag03,2,augmented_from_raw,mixed_real_and_augmented,Frontend batch data version`,
 ag03,1,999,0.5,0.02,upper,real,0,,original_coordinate`,
     performance_records:`perf_id,airfoil_id,version_id,alpha_deg,reynolds_number,cl,cd,cm,source_type,is_anomaly
 9910201,ag03,1,-3,123460,0.36,0.013,0.0,generated_synthetic,0
-9910202,ag03,1,3,123460,0.66,0.015,0.0,generated_synthetic,0`,
-    anomaly_records:`anomaly_id,perf_id,airfoil_id,version_id,rule_type,detail
-990001,95,ag04,1,extreme_cl,Frontend batch anomaly note`
+9910202,ag03,1,3,123460,0.66,0.015,0.0,generated_synthetic,0`
   },
   bad:{
+    data_sources:`source_type,description
+,Bad source without primary key`,
+    airfoils:`airfoil_id,name,source,family,is_generated,source_type,source_file,has_augmented_coordinates,original_point_count,final_point_count
+batchaf_bad,Bad Airfoil,Frontend Batch,Manual,2,generated_synthetic,batch/bad.dat,0,1,1`,
+    data_versions:`airfoil_id,version_id,version_type,coordinate_source_type,description
+ag03,3,bad_version_type,mixed_real_and_augmented,Bad version type`,
+    coordinate_points:`airfoil_id,version_id,point_order,x,y,surface,point_source,is_augmented,original_order,augmentation_method
+ag03,1,1000,0.5,0.02,middle,real,0,,original_coordinate`,
     performance_records:`perf_id,airfoil_id,version_id,alpha_deg,reynolds_number,cl,cd,cm,source_type,is_anomaly
 9910101,ag03,1,0,123459,0.52,0.011,0.0,generated_synthetic,0
 9910102,ag03,1,99,123459,0.60,0.014,0.0,generated_synthetic,0`
@@ -5244,7 +5283,10 @@ ag03,1,999,0.5,0.02,upper,real,0,,original_coordinate`,
 function updateBatchHeaderHint(){
   const table=$("batchImportTarget").value;
   const header=(BATCH_HEADERS[table]||[]).join(",");
-  $("batchExpectedHeader").innerHTML=`<b>目标关系：</b>${escapeHtml(table)}<br><b>期望表头：</b><code>${escapeHtml(header)}</code><br><span class="status">请保证 CSV/TSV 第一行表头与上面完全一致，列名不能缺失、不能多出、不能乱序；数据行也要按同样顺序填写。</span>`;
+  const idNote=table==="performance_records"
+    ?"<br><span class='status'>说明：perf_id 可作为文件内临时编号从 1 开始填写；导入时系统会自动重映射为数据库中的全局唯一主键，并在结果中显示映射表。异常数据表不支持直接批量导入，应由异常检测规则生成。</span>"
+    :"";
+  $("batchExpectedHeader").innerHTML=`<b>目标关系：</b>${escapeHtml(table)}<br><b>期望表头：</b><code>${escapeHtml(header)}</code><br><span class="status">请保证 CSV/TSV 第一行表头与上面完全一致，列名不能缺失、不能多出、不能乱序；数据行也要按同样顺序填写。</span>${idNote}`;
 }
 async function loadBatchFile(){
   const file=$("batchImportFile").files[0];
@@ -5254,7 +5296,11 @@ async function loadBatchFile(){
 }
 function loadBatchSample(kind){
   const table=$("batchImportTarget").value;
-  const sample=(BATCH_SAMPLES[kind]&&BATCH_SAMPLES[kind][table])||BATCH_SAMPLES.good[table]||BATCH_SAMPLES.good.performance_records;
+  const sample=BATCH_SAMPLES[kind]&&BATCH_SAMPLES[kind][table];
+  if(!sample){
+    $("batchImportResult").textContent=`No ${kind} sample is configured for ${table}.`;
+    return;
+  }
   $("batchImportId").value=kind==="bad"?"ui_bad_batch":"ui_good_batch";
   $("batchImportInput").value=sample;
   updateBatchHeaderHint();
