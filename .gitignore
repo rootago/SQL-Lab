@@ -1,0 +1,18 @@
+# Local runtime files
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Office temporary files
+~$*
+
+# Local reports and drafts
+draft.pptx
+old_memory.txt
+六-数据库设计(1).md
+*.docx
+*.pptx
+*.pdf
+*.png
