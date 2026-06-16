@@ -1563,6 +1563,101 @@ def performance_compare() -> Any:
     return jsonify(rows)
 
 
+@app.get("/api/condition_search")
+def condition_search() -> Any:
+    user = current_user()
+    if not user or not is_analyst_or_manager(user["role"]):
+        return jsonify({"error": "analyst/engineer/admin permission required"}), 403
+
+    start = time.perf_counter()
+    where = [
+        soft_delete_filter_sql("airfoils", "a"),
+        soft_delete_filter_sql("data_versions", "dv"),
+        soft_delete_filter_sql("performance_records", "p"),
+    ]
+    params: list[Any] = []
+
+    reynolds_number = request.args.get("reynolds_number", "").strip()
+    alpha_deg = request.args.get("alpha_deg", "").strip()
+    cl_min = request.args.get("cl_min", "").strip()
+    cl_max = request.args.get("cl_max", "").strip()
+    cd_min = request.args.get("cd_min", "").strip()
+    cd_max = request.args.get("cd_max", "").strip()
+    ld_min = request.args.get("ld_min", "").strip()
+    anomaly_only = request.args.get("anomaly_only", "0").strip()
+    include_anomaly = request.args.get("include_anomaly", "0").strip()
+    limit = request.args.get("limit", "100").strip()
+
+    try:
+        row_limit = min(max(int(limit or "100"), 1), 500)
+        if reynolds_number:
+            where.append("p.reynolds_number = %s")
+            params.append(int(reynolds_number))
+        if alpha_deg:
+            where.append("p.alpha_deg = %s")
+            params.append(float(alpha_deg))
+        if cl_min:
+            where.append("p.cl >= %s")
+            params.append(float(cl_min))
+        if cl_max:
+            where.append("p.cl <= %s")
+            params.append(float(cl_max))
+        if cd_min:
+            where.append("p.cd >= %s")
+            params.append(float(cd_min))
+        if cd_max:
+            where.append("p.cd <= %s")
+            params.append(float(cd_max))
+        if ld_min:
+            where.append("(p.cd <> 0 AND p.cl / p.cd >= %s)")
+            params.append(float(ld_min))
+    except ValueError:
+        return jsonify({"error": "numeric filters must be valid numbers"}), 400
+
+    if anomaly_only == "1":
+        where.append("p.is_anomaly = 1")
+    elif include_anomaly != "1":
+        where.append("p.is_anomaly = 0")
+
+    params.append(row_limit)
+    rows = query_all(
+        f"""
+        SELECT
+            p.airfoil_id,
+            a.name AS airfoil_name,
+            p.version_id,
+            dv.version_type,
+            dv.coordinate_source_type,
+            p.perf_id,
+            p.alpha_deg,
+            p.reynolds_number,
+            p.cl,
+            p.cd,
+            p.cm,
+            ROUND(p.cl / NULLIF(p.cd, 0), 6) AS lift_drag_ratio,
+            p.is_anomaly
+        FROM performance_records p
+        JOIN airfoils a ON a.airfoil_id = p.airfoil_id
+        JOIN data_versions dv
+          ON dv.airfoil_id = p.airfoil_id
+         AND dv.version_id = p.version_id
+        WHERE {" AND ".join(where)}
+        ORDER BY p.cl DESC, lift_drag_ratio DESC, p.cd ASC, p.airfoil_id, p.version_id
+        LIMIT %s
+        """,
+        tuple(params),
+    )
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_user_action(
+        user["user_id"],
+        "condition search for matching airfoils and versions",
+        "SELECT performance_records JOIN airfoils JOIN data_versions WHERE operating conditions",
+        1,
+        elapsed_ms,
+    )
+    return jsonify({"elapsed_ms": elapsed_ms, "rows": rows, "row_count": len(rows)})
+
+
 @app.get("/api/version_compare")
 def version_compare() -> Any:
     reynolds_number = int(request.args.get("reynolds_number", "50000"))
@@ -4547,6 +4642,23 @@ INDEX_HTML = r"""
         </div>
         <div id="mainTableSection">
           <div class="toolbar">
+            <h2>工况反查翼型与版本</h2>
+            <div class="status">按 Re、攻角、CL、CD、CL/CD 查询满足要求的 airfoils 与 data_versions</div>
+          </div>
+          <div class="indexColumnBox keyFilterBox" id="conditionSearchBox">
+            <div class="keyFilter"><span>Reynolds number</span><input id="conditionRe" placeholder="100000"></div>
+            <div class="keyFilter"><span>alpha_deg</span><input id="conditionAlpha" placeholder="6"></div>
+            <div class="keyFilter"><span>CL min</span><input id="conditionClMin" placeholder="0.5"></div>
+            <div class="keyFilter"><span>CL max</span><input id="conditionClMax" placeholder="optional"></div>
+            <div class="keyFilter"><span>CD min</span><input id="conditionCdMin" placeholder="optional"></div>
+            <div class="keyFilter"><span>CD max</span><input id="conditionCdMax" placeholder="0.05"></div>
+            <div class="keyFilter"><span>CL/CD min</span><input id="conditionLdMin" placeholder="optional"></div>
+            <div class="keyFilter"><span>异常记录</span><select id="conditionAnomalyMode"><option value="normal">排除异常</option><option value="include">包含异常</option><option value="only">只看异常</option></select></div>
+            <div class="keyFilter"><span>limit</span><select id="conditionLimit"><option value="50">50 rows</option><option value="100" selected>100 rows</option><option value="300">300 rows</option></select></div>
+            <div class="keyFilter"><span>&nbsp;</span><button class="action primary" id="runConditionSearchBtn">查询满足条件的翼型</button></div>
+          </div>
+          <div class="box" id="conditionSearchResult">输入工况条件后，可反查满足性能要求的翼型与版本。</div>
+          <div class="toolbar">
             <h2>主数据表查看</h2>
             <div class="experimentControls" id="governanceTableControls"></div>
           </div>
@@ -4810,6 +4922,7 @@ async function init(){
   $("loadLogsBtn").addEventListener("click",loadLogs);
   document.querySelectorAll(".adminTraceBtn").forEach(btn=>btn.addEventListener("click",()=>openAdminReviewTable(btn.dataset.table)));
   $("loadMainTableBtn").addEventListener("click",loadMainTable);
+  $("runConditionSearchBtn").addEventListener("click",runConditionSearch);
   $("adminTableSelect").addEventListener("change",changeMainTable);
   $("toggleMainAddBtn").addEventListener("click",toggleMainAddForm);
   $("mainTableModeBtn").addEventListener("click",showMainTableMode);
@@ -4988,6 +5101,43 @@ async function showMainTableMode(){
   $("mainTableModeBtn").classList.add("primary");
   $("mainTableResult").textContent="请选择关系并查看主表。";
   await loadMainTableFilters();
+}
+async function runConditionSearch(){
+  try{
+    const params=new URLSearchParams();
+    const mapping={
+      conditionRe:"reynolds_number",
+      conditionAlpha:"alpha_deg",
+      conditionClMin:"cl_min",
+      conditionClMax:"cl_max",
+      conditionCdMin:"cd_min",
+      conditionCdMax:"cd_max",
+      conditionLdMin:"ld_min"
+    };
+    Object.entries(mapping).forEach(([id,key])=>{
+      const value=$(id).value.trim();
+      if(value)params.set(key,value);
+    });
+    params.set("limit",$("conditionLimit").value);
+    const mode=$("conditionAnomalyMode").value;
+    if(mode==="include")params.set("include_anomaly","1");
+    if(mode==="only")params.set("anomaly_only","1");
+    $("conditionSearchResult").textContent="正在按工况查询满足条件的翼型与版本...";
+    const data=await getJson(`/api/condition_search?${params.toString()}`);
+    const conditionText=[
+      params.get("reynolds_number")?`Re = ${escapeHtml(params.get("reynolds_number"))}`:"",
+      params.get("alpha_deg")?`alpha = ${escapeHtml(params.get("alpha_deg"))}`:"",
+      params.get("cl_min")?`CL >= ${escapeHtml(params.get("cl_min"))}`:"",
+      params.get("cl_max")?`CL <= ${escapeHtml(params.get("cl_max"))}`:"",
+      params.get("cd_min")?`CD >= ${escapeHtml(params.get("cd_min"))}`:"",
+      params.get("cd_max")?`CD <= ${escapeHtml(params.get("cd_max"))}`:"",
+      params.get("ld_min")?`CL/CD >= ${escapeHtml(params.get("ld_min"))}`:"",
+      mode==="normal"?"is_anomaly = 0":mode==="only"?"is_anomaly = 1":"include anomalies"
+    ].filter(Boolean).join(" · ")||"all conditions";
+    $("conditionSearchResult").innerHTML=`<div class="status">Condition search · ${conditionText} · Rows=${data.row_count} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows)}`;
+  }catch(e){
+    $("conditionSearchResult").textContent=`Condition search failed: ${e.error||e.message||"unknown error"}`;
+  }
 }
 async function loadUsers(){try{$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/users"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
 async function loadLogs(){try{$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/query_logs"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
