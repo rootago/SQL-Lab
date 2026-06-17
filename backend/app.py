@@ -22,6 +22,8 @@ _AUTH_SCHEMA_READY = False
 _SAVED_TRANSACTION_SCHEMA_READY = False
 _LINEAGE_SCHEMA_READY = False
 _IMPORT_SCHEMA_READY = False
+_AUDIT_SCHEMA_READY = False
+_AIRFOIL_SCHEMA_READY = False
 _SOFT_DELETE_SCHEMA_READY = False
 _ANOMALY_TRIGGER_SCHEMA_READY = False
 _PERFORMANCE_TRIGGER_SCHEMA_READY = False
@@ -273,12 +275,14 @@ def log_data_import(
     source_type: str | None = None,
     description: str | None = None,
 ) -> None:
+    record_version_id = current_record_version_id(target_table, record_pk)
     execute_write(
         """
         INSERT INTO data_import_records
             (target_table, record_pk, airfoil_id, version_id, source_type,
-             entry_method, created_by_user_id, created_by_username, description)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+             entry_method, created_by_user_id, created_by_username, description,
+             previous_record_version_id, record_version_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
         ON DUPLICATE KEY UPDATE
             airfoil_id = VALUES(airfoil_id),
             version_id = VALUES(version_id),
@@ -286,7 +290,9 @@ def log_data_import(
             created_by_user_id = VALUES(created_by_user_id),
             created_by_username = VALUES(created_by_username),
             created_at = CURRENT_TIMESTAMP,
-            description = VALUES(description)
+            description = VALUES(description),
+            previous_record_version_id = VALUES(previous_record_version_id),
+            record_version_id = VALUES(record_version_id)
         """,
         (
             target_table,
@@ -298,6 +304,7 @@ def log_data_import(
             None if user is None else user.get("user_id"),
             "system" if user is None else user.get("username"),
             description,
+            record_version_id,
         ),
     )
 
@@ -568,8 +575,12 @@ def ensure_import_schema() -> None:
             """
         )
     }
-    if "record_version_id" in import_columns:
-        execute_write("ALTER TABLE data_import_records DROP COLUMN record_version_id")
+    if "previous_record_version_id" not in import_columns:
+        execute_write("ALTER TABLE data_import_records ADD COLUMN previous_record_version_id INT NULL AFTER description")
+    if "record_version_id" not in import_columns:
+        execute_write("ALTER TABLE data_import_records ADD COLUMN record_version_id INT NOT NULL DEFAULT 0 AFTER previous_record_version_id")
+    else:
+        execute_write("ALTER TABLE data_import_records MODIFY COLUMN record_version_id INT NOT NULL DEFAULT 0")
     for sql in [
         """
         INSERT INTO data_import_records
@@ -595,6 +606,70 @@ def ensure_import_schema() -> None:
     ]:
         execute_write(sql)
     _IMPORT_SCHEMA_READY = True
+
+
+def ensure_audit_schema() -> None:
+    global _AUDIT_SCHEMA_READY
+    if _AUDIT_SCHEMA_READY:
+        return
+    audit_columns = {
+        row["column_name"]
+        for row in query_all(
+            """
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'audit_logs'
+            """
+        )
+    }
+    if "previous_record_version_id" not in audit_columns:
+        execute_write("ALTER TABLE audit_logs ADD COLUMN previous_record_version_id INT NULL AFTER record_pk")
+    if "record_version_id" not in audit_columns:
+        execute_write("ALTER TABLE audit_logs ADD COLUMN record_version_id INT NOT NULL DEFAULT 0 AFTER previous_record_version_id")
+    else:
+        execute_write("ALTER TABLE audit_logs MODIFY COLUMN record_version_id INT NOT NULL DEFAULT 0")
+    _AUDIT_SCHEMA_READY = True
+
+
+def ensure_airfoil_schema() -> None:
+    global _AIRFOIL_SCHEMA_READY
+    if _AIRFOIL_SCHEMA_READY:
+        return
+    indexes = query_all(
+        """
+        SELECT INDEX_NAME AS index_name,
+               GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns,
+               MIN(NON_UNIQUE) AS non_unique
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'airfoils'
+        GROUP BY INDEX_NAME
+        """
+    )
+    for row in indexes:
+        columns = str(row.get("columns") or "")
+        if row.get("index_name") == "uq_airfoils_source_file" and columns == "source_file" and int(row.get("non_unique") or 1) == 0:
+            execute_write("ALTER TABLE airfoils DROP INDEX uq_airfoils_source_file")
+    refreshed = query_all(
+        """
+        SELECT INDEX_NAME AS index_name,
+               GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns,
+               MIN(NON_UNIQUE) AS non_unique
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'airfoils'
+        GROUP BY INDEX_NAME
+        """
+    )
+    if not any(
+        row.get("index_name") == "uq_airfoils_id_source_file"
+        and str(row.get("columns") or "") == "airfoil_id,source_file"
+        and int(row.get("non_unique") or 1) == 0
+        for row in refreshed
+    ):
+        execute_write("ALTER TABLE airfoils ADD UNIQUE KEY uq_airfoils_id_source_file (airfoil_id, source_file)")
+    _AIRFOIL_SCHEMA_READY = True
 
 
 def sync_import_records() -> None:
@@ -1016,14 +1091,35 @@ def ensure_performance_trigger_schema() -> None:
         CREATE TRIGGER trg_audit_performance_update
         AFTER UPDATE ON performance_records
         FOR EACH ROW
+        FOLLOWS trg_lineage_performance_update
         BEGIN
             INSERT INTO audit_logs
-                (table_name, operation_type, record_pk, old_values, new_values)
+                (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
             VALUES
                 (
                     'performance_records',
                     'UPDATE',
                     CAST(OLD.perf_id AS CHAR),
+                    COALESCE(
+                        (
+                            SELECT previous_record_version_id
+                            FROM data_record_lineage
+                            WHERE table_name = 'performance_records'
+                              AND record_pk = CAST(OLD.perf_id AS CHAR)
+                            LIMIT 1
+                        ),
+                        0
+                    ),
+                    COALESCE(
+                        (
+                            SELECT record_version_id
+                            FROM data_record_lineage
+                            WHERE table_name = 'performance_records'
+                              AND record_pk = CAST(OLD.perf_id AS CHAR)
+                            LIMIT 1
+                        ),
+                        1
+                    ),
                     JSON_OBJECT(
                         'cl', OLD.cl,
                         'cd', OLD.cd,
@@ -1190,6 +1286,8 @@ def before_request() -> None:
     ensure_saved_transaction_schema()
     ensure_lineage_schema()
     ensure_import_schema()
+    ensure_audit_schema()
+    ensure_airfoil_schema()
     ensure_soft_delete_schema()
     ensure_core_trigger_schema()
     ensure_performance_trigger_schema()
@@ -1387,9 +1485,9 @@ MAIN_TABLE_KEY_FILTERS = {
     "coordinate_points": ["airfoil_id", "version_id", "point_order"],
     "performance_records": ["perf_id", "airfoil_id", "version_id"],
     "anomaly_records": ["anomaly_id", "perf_id", "airfoil_id", "version_id"],
-    "audit_logs": ["audit_id", "table_name", "record_pk"],
-    "data_record_lineage": ["lineage_id", "table_name", "record_pk", "airfoil_id"],
-    "data_import_records": ["import_id", "target_table", "record_pk", "airfoil_id"],
+    "audit_logs": ["audit_id", "table_name", "record_pk", "previous_record_version_id", "record_version_id"],
+    "data_record_lineage": ["lineage_id", "table_name", "record_pk", "airfoil_id", "previous_record_version_id", "record_version_id"],
+    "data_import_records": ["import_id", "target_table", "record_pk", "airfoil_id", "previous_record_version_id", "record_version_id"],
     "soft_delete_records": ["delete_id", "table_name", "record_pk", "airfoil_id"],
     "performance_import_staging": ["staging_id", "batch_id", "perf_id"],
     "saved_transactions": ["saved_id", "user_id"],
@@ -1923,8 +2021,11 @@ def admin_main_table() -> Any:
         value = request.args.get(f"filter_{column}", "").strip()
         if value:
             filters[column] = value
-            where_parts.append(f"CAST(`{column}` AS CHAR) = %s")
-            params.append(value)
+            if table_name == "data_record_lineage" and column == "previous_record_version_id" and value.lower() in {"null", "none", "空"}:
+                where_parts.append("`previous_record_version_id` IS NULL")
+            else:
+                where_parts.append(f"CAST(`{column}` AS CHAR) = %s")
+                params.append(value)
     if table_name in SOFT_DELETE_TARGET_TABLES:
         where_parts.append(soft_delete_filter_sql(table_name))
     where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
@@ -1968,6 +2069,19 @@ def friendly_mysql_error(exc: pymysql.MySQLError, table_name: str = "") -> str:
     code = exc.args[0] if exc.args else None
     message = str(exc)
     if code == 1062:
+        duplicated = re.search(r"Duplicate entry '([^']+)' for key '([^']+)'", message)
+        if duplicated:
+            value, key_name = duplicated.groups()
+            key_hint = key_name.split(".")[-1]
+            if "source_file" in key_hint:
+                return f"{table_name or '记录'} 创建失败：airfoil_id + source_file 组合重复（{value}）。同一翼型不能重复登记同一个源文件。"
+            if "PRIMARY" in key_hint.upper() or "airfoil_id" in key_hint:
+                return f"{table_name or '记录'} 创建失败：主键重复（{value}），数据库中已经存在这条记录。请换一个编号，或编辑已有记录。"
+            if "version" in key_hint:
+                return f"{table_name or '记录'} 创建失败：版本主键重复（{value}）。该翼型下已经存在这个 version_id，请换成更大的版本号。"
+            if "coordinate" in key_hint or "point" in key_hint:
+                return f"{table_name or '记录'} 创建失败：坐标点主键重复（{value}）。该翼型版本下已经存在这个 point_order，请换成下一点序号。"
+            return f"{table_name or '记录'} 创建失败：唯一字段 {key_hint} 重复（{value}）。"
         return f"{table_name or '记录'} 创建失败：主键或唯一字段重复，数据库中已经存在相同记录。"
     if code == 1452:
         if table_name == "coordinate_points":
@@ -1991,6 +2105,32 @@ def friendly_mysql_error(exc: pymysql.MySQLError, table_name: str = "") -> str:
                 return "coordinate_points 创建失败：真实点必须为 real + is_augmented=0 + original_coordinate；增强点必须为 augmented + is_augmented=1 + linear_interpolation。"
         return f"{table_name or '记录'} 创建失败：违反了表的 CHECK 约束，请检查字段取值范围和枚举值。"
     return message
+
+
+def airfoil_create_conflict_message(airfoil_id: str, source_file: str) -> str | None:
+    rows = query_all(
+        """
+        SELECT a.airfoil_id, a.source_file, sd.delete_id, sd.is_active
+        FROM airfoils a
+        LEFT JOIN soft_delete_records sd
+          ON sd.table_name = 'airfoils'
+         AND sd.record_pk = a.airfoil_id
+         AND sd.is_active = 1
+        WHERE a.airfoil_id = %s
+           OR (a.airfoil_id = %s AND a.source_file = %s)
+        LIMIT 5
+        """,
+        (airfoil_id, airfoil_id, source_file),
+    )
+    for row in rows:
+        if row.get("airfoil_id") == airfoil_id:
+            if int(row.get("is_active") or 0) == 1:
+                return f"airfoils 创建失败：airfoil_id={airfoil_id} 已被逻辑删除但仍保留在数据库中。请到 管理审计 -> 逻辑删除记录 中恢复，或换一个 airfoil_id。"
+            return f"airfoils 创建失败：airfoil_id={airfoil_id} 已存在。airfoils 的主键是 airfoil_id，不能重复；请编辑已有记录或换编号。"
+    for row in rows:
+        if row.get("airfoil_id") == airfoil_id and row.get("source_file") == source_file:
+            return f"airfoils 创建失败：airfoil_id={airfoil_id} 与 source_file={source_file} 的组合已存在。请编辑已有记录，或换一个 airfoil_id/source_file 组合。"
+    return None
 
 
 @app.errorhandler(pymysql.MySQLError)
@@ -3937,11 +4077,16 @@ END;""",
             "sql": """CREATE TRIGGER trg_audit_performance_update
 AFTER UPDATE ON performance_records
 FOR EACH ROW
+FOLLOWS trg_lineage_performance_update
 BEGIN
     INSERT INTO audit_logs
-        (table_name, operation_type, record_pk, old_values, new_values)
+        (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
     VALUES
         ('performance_records', 'UPDATE', CAST(OLD.perf_id AS CHAR),
+         COALESCE((SELECT previous_record_version_id FROM data_record_lineage
+                   WHERE table_name = 'performance_records' AND record_pk = CAST(OLD.perf_id AS CHAR) LIMIT 1), 0),
+         COALESCE((SELECT record_version_id FROM data_record_lineage
+                   WHERE table_name = 'performance_records' AND record_pk = CAST(OLD.perf_id AS CHAR) LIMIT 1), 1),
          JSON_OBJECT('cl', OLD.cl, 'cd', OLD.cd, 'cm', OLD.cm, 'is_anomaly', OLD.is_anomaly),
          JSON_OBJECT('cl', NEW.cl, 'cd', NEW.cd, 'cm', NEW.cm, 'is_anomaly', NEW.is_anomaly));
 END;""",
@@ -4941,6 +5086,8 @@ INDEX_HTML = r"""
     h1 { font-size:24px; line-height:1.15; font-weight:760; }
     h2 { margin:0 0 10px; font-size:15px; line-height:1.25; font-weight:720; }
     .sub,.status { color:var(--muted); font-size:13px; line-height:1.45; overflow-wrap:anywhere; }
+    #airfoilMeta { display:block; line-height:1.55; }
+    #airfoilMeta b { color:#3a4338; font-weight:700; }
     .authGate {
       position:fixed;
       inset:0;
@@ -5312,7 +5459,9 @@ INDEX_HTML = r"""
       margin:0;
       max-height:300px;
       overflow:auto;
-      white-space:pre;
+      white-space:pre-wrap;
+      overflow-wrap:anywhere;
+      word-break:break-word;
       border:0;
       background:#fff;
       padding:10px 12px;
@@ -5321,7 +5470,11 @@ INDEX_HTML = r"""
       line-height:1.5;
       color:#172033;
     }
-    #adminResult { max-height:calc(100vh - 220px); min-height:360px; }
+    #adminReviewFilterBox { display:none; margin-bottom:10px; }
+    #adminReviewFilterBox.visible { display:grid; }
+    #adminResult { max-height:none; height:calc(100vh - 260px); min-height:420px; overflow:auto; }
+    #adminResult .tableWrap { max-height:calc(100vh - 340px); overflow:auto; padding-bottom:8px; scrollbar-gutter:stable both-edges; }
+    #adminResult table { min-width:max-content; }
     #governanceResult { max-height:none; height:calc(100vh - 260px); min-height:360px; overflow:auto; }
     #mainTableResult { max-height:none; min-height:360px; overflow:auto; }
     #governanceResult .tableWrap,#mainTableResult .tableWrap { max-height:calc(100vh - 350px); overflow:auto; padding-bottom:8px; }
@@ -5461,6 +5614,7 @@ INDEX_HTML = r"""
             <button class="action" id="loadMainTableBtn">查看主表</button>
           </div>
         </div>
+        <div class="indexColumnBox keyFilterBox" id="adminReviewFilterBox"></div>
         <div class="box" id="adminResult">engineer/admin 可查看 users、query_logs 与主数据表。</div>
         <div class="createRow" id="adminCreateUserRow">
           <input id="adminNewUsername" placeholder="new username">
@@ -5866,14 +6020,27 @@ function rowsToTable(rows,options={}){
   const cols=Object.keys(rows[0]);
   const editableTable=isManager()&&["data_sources","airfoils","data_versions","coordinate_points","performance_records","anomaly_records"].includes(options.table);
   const restorableTable=isAdmin()&&options.table==="soft_delete_records";
+  const adminRecordButtons=r=>{
+    if(!isAdmin()||!editableTable)return "";
+    const payload=escapeHtml(JSON.stringify(r));
+    return [
+      `<button class="action rowAdminTraceBtn" data-review-table="data_import_records" data-table="${escapeHtml(options.table)}" data-row="${payload}">来源</button>`,
+      `<button class="action rowAdminTraceBtn" data-review-table="data_record_lineage" data-table="${escapeHtml(options.table)}" data-row="${payload}">追溯</button>`,
+      `<button class="action rowAdminTraceBtn" data-review-table="audit_logs" data-table="${escapeHtml(options.table)}" data-row="${payload}">审计</button>`
+    ].join("");
+  };
   const actionCell=r=>{
     if(editableTable){
       const payload=escapeHtml(JSON.stringify(r));
-      return `<td><div class="rowActions"><button class="action rowEditBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">编辑</button><button class="action rowDeleteBtn mainRowDeleteBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">删除</button></div></td>`;
+      return `<td><div class="rowActions"><button class="action rowEditBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">编辑</button><button class="action rowDeleteBtn mainRowDeleteBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">删除</button>${adminRecordButtons(r)}</div></td>`;
     }
     if(restorableTable){
       const active=String(r.is_active??"0")==="1";
       return `<td><div class="rowActions">${active?`<button class="action restoreDeleteBtn" data-delete-id="${escapeHtml(r.delete_id)}" data-table="${escapeHtml(r.table_name||"")}" data-record-pk="${escapeHtml(r.record_pk||"")}">恢复</button>`:`<span class="status">已恢复</span>`}</div></td>`;
+    }
+    if(options.table==="data_record_lineage"){
+      const payload=escapeHtml(JSON.stringify(r));
+      return `<td><div class="rowActions"><button class="action lineageToAuditBtn" data-row="${payload}">查看审计</button></div></td>`;
     }
     return "";
   };
@@ -5885,8 +6052,40 @@ function rowsToTable(rows,options={}){
     }
     return `<td>${escapeHtml(r[c])}</td>`;
   };
-  const actionHead=(editableTable||restorableTable)?"<th>操作</th>":"";
+  const actionHead=(editableTable||restorableTable||options.table==="data_record_lineage")?"<th>操作</th>":"";
   return `<div class="tableWrap"><table><thead><tr>${actionHead}${cols.map(c=>`<th>${escapeHtml(fieldLabel(c))}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${actionCell(r)}${cols.map(c=>cell(r,c)).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+function noRowsHint(table,target,filters){
+  const filterText=Object.entries(filters||{}).map(([k,v])=>`${fieldLabel(k)}=${v}`).join("，")||"全部";
+  return `<div class="status">没有查到记录。当前审计表：${escapeHtml(table)}；目标关系：${escapeHtml(target)}；筛选条件：${escapeHtml(filterText)}。可以换一个目标关系，或清空上方筛选条件后再查。</div>`;
+}
+function rowRecordPk(table,row){
+  if(table==="data_sources")return row.source_type;
+  if(table==="airfoils")return row.airfoil_id;
+  if(table==="data_versions")return `${row.airfoil_id}#${row.version_id}`;
+  if(table==="coordinate_points")return `${row.airfoil_id}#${row.version_id}#${row.point_order}`;
+  if(table==="performance_records")return row.perf_id;
+  if(table==="anomaly_records")return row.anomaly_id;
+  return row.record_pk||row.id||"";
+}
+function tablePrimaryKeyColumns(table){
+  return {
+    data_sources:["source_type"],
+    airfoils:["airfoil_id"],
+    data_versions:["airfoil_id","version_id"],
+    coordinate_points:["airfoil_id","version_id","point_order"],
+    performance_records:["perf_id"],
+    anomaly_records:["anomaly_id"]
+  }[table]||["record_pk"];
+}
+function buildRecordPkFromFilters(table,values){
+  if(table==="data_sources")return values.source_type||"";
+  if(table==="airfoils")return values.airfoil_id||"";
+  if(table==="data_versions")return values.airfoil_id&&values.version_id?`${values.airfoil_id}#${values.version_id}`:"";
+  if(table==="coordinate_points")return values.airfoil_id&&values.version_id&&values.point_order?`${values.airfoil_id}#${values.version_id}#${values.point_order}`:"";
+  if(table==="performance_records")return values.perf_id||"";
+  if(table==="anomaly_records")return values.anomaly_id||"";
+  return values.record_pk||"";
 }
 function showSqlResult(target,data){
   const meta=`<h2>执行性能</h2><div class="status">Rows: ${data.row_count} · Time: ${data.elapsed_ms} ms${data.affected_rows==null?"":` · Affected: ${data.affected_rows}`}</div>`;
@@ -5964,6 +6163,7 @@ async function init(){
   $("loadUsersBtn").addEventListener("click",loadUsers);
   $("loadLogsBtn").addEventListener("click",loadLogs);
   document.querySelectorAll(".adminTraceBtn").forEach(btn=>btn.addEventListener("click",()=>openAdminReviewTable(btn.dataset.table)));
+  $("adminAuditTargetSelect").addEventListener("change",()=>{if(state.adminReviewTable)openAdminReviewTable(state.adminReviewTable);});
   $("loadMainTableBtn").addEventListener("click",loadMainTable);
   $("runConditionSearchBtn").addEventListener("click",runConditionSearch);
   $("adminTableSelect").addEventListener("change",changeMainTable);
@@ -6203,11 +6403,61 @@ async function runConditionSearch(){
     $("conditionSearchResult").textContent=`Condition search failed: ${e.error||e.message||"unknown error"}`;
   }
 }
-async function loadUsers(){try{$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/users"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
-async function loadLogs(){try{$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/query_logs"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
-async function openAdminReviewTable(table){
+function hideAdminReviewFilters(){
+  const box=$("adminReviewFilterBox");
+  if(box){box.classList.remove("visible");box.innerHTML="";}
+  state.adminReviewTable=null;
+}
+async function loadUsers(){try{hideAdminReviewFilters();$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/users"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
+async function loadLogs(){try{hideAdminReviewFilters();$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/query_logs"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
+async function loadAdminReviewFilters(table){
+  const box=$("adminReviewFilterBox");
+  if(!box)return;
+  const target=$("adminAuditTargetSelect")?.value||"airfoils";
+  const previous={};
+  const presets=state.adminReviewPresetFilters||{};
+  document.querySelectorAll(".adminReviewPkFilter").forEach(input=>previous[input.dataset.pkColumn]=input.value);
+  document.querySelectorAll(".adminReviewExtraFilter").forEach(input=>previous[input.dataset.filterColumn]=input.value);
+  box.classList.add("visible");
+  box.innerHTML=`<div class="status">正在加载 ${escapeHtml(target)} 主键筛选项...</div>`;
+  const meta=await getJson(`/api/admin/main_table?table=${encodeURIComponent(target)}&limit=1&include_options=1`);
+  const pkColumns=tablePrimaryKeyColumns(target);
+  const options=meta.filter_options||{};
+  const pkHtml=pkColumns.map(column=>{
+    const values=options[column]||[];
+    const current=String(presets[column]??previous[column]??"");
+    if(values.length){
+      return `<label class="keyFilter"><span>${escapeHtml(fieldLabel(column))}</span><select class="adminReviewPkFilter" data-pk-column="${escapeHtml(column)}"><option value="">全部</option>${values.map(value=>`<option value="${escapeHtml(value)}" ${current===String(value)?"selected":""}>${escapeHtml(value)}</option>`).join("")}</select></label>`;
+    }
+    return `<label class="keyFilter"><span>${escapeHtml(fieldLabel(column))}</span><input class="adminReviewPkFilter" data-pk-column="${escapeHtml(column)}" value="${escapeHtml(current)}" placeholder="输入 ${escapeHtml(column)} 检索"></label>`;
+  }).join("");
+  const hasRecordVersionFilters=["data_record_lineage","data_import_records","audit_logs"].includes(table);
+  const lineageHtml=hasRecordVersionFilters
+    ? ["previous_record_version_id","record_version_id"].map(column=>{
+        const current=String(presets[column]??previous[column]??"");
+        const hint=column==="previous_record_version_id" ? "旧值版本，如 1；初始/来源可填 null" : "新值版本，如 0 或 2";
+        return `<label class="keyFilter"><span>${escapeHtml(fieldLabel(column))}</span><input class="adminReviewExtraFilter" data-filter-column="${escapeHtml(column)}" value="${escapeHtml(current)}" placeholder="${escapeHtml(hint)}"></label>`;
+      }).join("")
+    : "";
+  const lineageHint=hasRecordVersionFilters
+    ? "；也可填写旧值记录版本和新值记录版本，查询某条记录的版本来源或修改过程"
+    : "";
+  const reviewMeaning={
+    data_import_records:"来源/版本写入记录：说明该记录由谁、通过系统/SQL/前端、从哪个来源写入。",
+    data_record_lineage:"记录修改追溯：说明该记录当前版本、上一版本、最后修改者和修改次数。",
+    audit_logs:"审计日志：记录 UPDATE/DELETE 等操作的修改前数据和修改后数据。",
+    soft_delete_records:"逻辑删除记录：保存被删除记录的完整快照，并支持恢复。"
+  }[table]||"管理员审查记录。";
+  box.innerHTML=pkHtml+lineageHtml+`<div class="status">${escapeHtml(reviewMeaning)}<br>按 ${escapeHtml(target)} 的主键检索当前审计表；不填主键则显示该关系的全部相关记录${lineageHint}。</div>`;
+  document.querySelectorAll(".adminReviewPkFilter,.adminReviewExtraFilter").forEach(input=>{
+    input.addEventListener("change",()=>openAdminReviewTable(table,{reloadFilters:false}));
+    if(input.tagName==="INPUT")input.addEventListener("keydown",event=>{if(event.key==="Enter")openAdminReviewTable(table,{reloadFilters:false});});
+  });
+}
+async function openAdminReviewTable(table,options={}){
   try{
     showPage("admin");
+    state.adminReviewTable=table;
     const target=$("adminAuditTargetSelect")?.value||"airfoils";
     const params=new URLSearchParams({table,limit:"100"});
     if(table==="data_record_lineage"||table==="audit_logs"||table==="soft_delete_records"){
@@ -6215,10 +6465,29 @@ async function openAdminReviewTable(table){
     }else if(table==="data_import_records"){
       params.set("filter_target_table",target);
     }
+    if(options.reloadFilters!==false){
+      state.adminReviewPresetFilters=options.filters||{};
+      await loadAdminReviewFilters(table);
+    }
+    const pkValues={};
+    document.querySelectorAll(".adminReviewPkFilter").forEach(input=>{
+      pkValues[input.dataset.pkColumn]=input.value.trim();
+    });
+    const recordPk=buildRecordPkFromFilters(target,pkValues);
+    if(recordPk)params.set("filter_record_pk",recordPk);
+    if(["data_record_lineage","data_import_records","audit_logs"].includes(table)){
+      document.querySelectorAll(".adminReviewExtraFilter").forEach(input=>{
+        const value=input.value.trim();
+        if(value)params.set(`filter_${input.dataset.filterColumn}`,value);
+      });
+    }
+    if(options.reloadFilters!==false)state.adminReviewPresetFilters={};
     $("adminResult").textContent=`正在审查 ${table} / ${target}...`;
     const data=await getJson(`/api/admin/main_table?${params.toString()}`);
     const label=table==="users"||table==="query_logs" ? data.table : `${data.table} · target ${target}`;
-    $("adminResult").innerHTML=`<div class="status">Admin review: ${escapeHtml(label)} · showing ${data.rows.length} / ${data.total} rows</div>${rowsToTable(data.rows,{table:data.table})}`;
+    const activeFilters=Object.entries(data.filters||{}).map(([k,v])=>`${escapeHtml(fieldLabel(k))} = "${escapeHtml(v)}"`).join(" · ")||"全部";
+    const resultHtml=data.rows.length?rowsToTable(data.rows,{table:data.table}):noRowsHint(data.table,target,data.filters||{});
+    $("adminResult").innerHTML=`<div class="status">Admin review: ${escapeHtml(label)} · showing ${data.rows.length} / ${data.total} rows · filters: ${activeFilters}</div>${resultHtml}`;
     attachAdminResultActions();
   }catch(e){
     $("adminResult").textContent=e.error||e.message||String(e);
@@ -6244,6 +6513,25 @@ function attachAdminResultActions(){
   document.querySelectorAll(".restoreDeleteBtn").forEach(btn=>{
     btn.addEventListener("click",()=>restoreSoftDeletedRecord(btn.dataset.deleteId,btn.dataset.table,btn.dataset.recordPk));
   });
+  document.querySelectorAll(".lineageToAuditBtn").forEach(btn=>{
+    btn.addEventListener("click",()=>{
+      const row=JSON.parse(btn.dataset.row||"{}");
+      const target=row.table_name||$("adminAuditTargetSelect")?.value||"airfoils";
+      const presets={record_pk:String(row.record_pk??"")};
+      const pkColumns=tablePrimaryKeyColumns(target);
+      if(pkColumns.length===1){
+        presets[pkColumns[0]]=String(row.record_pk??"");
+      }
+      if(row.previous_record_version_id!==undefined&&row.previous_record_version_id!==null){
+        presets.previous_record_version_id=String(row.previous_record_version_id);
+      }
+      if(row.record_version_id!==undefined&&row.record_version_id!==null){
+        presets.record_version_id=String(row.record_version_id);
+      }
+      $("adminAuditTargetSelect").value=target;
+      openAdminReviewTable("audit_logs",{filters:presets});
+    });
+  });
 }
 function syncMainTableOptions(){
   const blocked=new Set(["users","query_logs","audit_logs","data_record_lineage","data_import_records","soft_delete_records","performance_import_staging","saved_transactions"]);
@@ -6259,6 +6547,19 @@ function invalidateMainTableFilters(table=null){
   if(table)delete state.mainFilterCache[table];
   else state.mainFilterCache={};
 }
+async function refreshAdminReviewAfterMutation(table){
+  if(!isAdmin()||!state.adminReviewTable)return;
+  const target=$("adminAuditTargetSelect")?.value||"";
+  if(table&&target&&table!==target&&!["airfoils","data_versions","coordinate_points","performance_records","anomaly_records","data_sources"].includes(target))return;
+  const presets={};
+  document.querySelectorAll(".adminReviewPkFilter").forEach(input=>presets[input.dataset.pkColumn]=input.value);
+  document.querySelectorAll(".adminReviewExtraFilter").forEach(input=>presets[input.dataset.filterColumn]=input.value);
+  try{
+    await openAdminReviewTable(state.adminReviewTable,{filters:presets});
+  }catch(err){
+    console.error(err);
+  }
+}
 async function refreshMainDataAfterMutation(options={}){
   const table=options.table||$("adminTableSelect")?.value||null;
   invalidateMainTableFilters(table);
@@ -6273,6 +6574,7 @@ async function refreshMainDataAfterMutation(options={}){
     await loadMainTableFilters();
     await loadMainTable();
   }
+  await refreshAdminReviewAfterMutation(table);
   if(state.selectedAirfoil&&options.reloadVersion!==false){
     loadVersionData().catch(err=>console.error(err));
   }
@@ -6320,24 +6622,26 @@ function renderMainAddForm(visible){
   const field=(name,placeholder="",value="")=>`<label class="keyFilter"><span>${escapeHtml(fieldLabel(name))}</span><input class="mainAddInput" data-field="${escapeHtml(name)}" placeholder="${escapeHtml(placeholder||name)}" value="${escapeHtml(value)}"></label>`;
   const select=(name,options)=>`<label class="keyFilter"><span>${escapeHtml(fieldLabel(name))}</span><select class="mainAddInput" data-field="${escapeHtml(name)}">${options}</select></label>`;
   const airfoilOptions=(state.airfoils||[]).map(a=>`<option value="${escapeHtml(a.airfoil_id)}" ${a.airfoil_id===state.selectedAirfoil?"selected":""}>${escapeHtml(a.airfoil_id)} · ${escapeHtml(a.name||"")}</option>`).join("");
+  const newId=`frontend_${Date.now().toString(36).slice(-6)}`;
+  const selectedAirfoil=state.selectedAirfoil||(state.airfoils&&state.airfoils[0]?.airfoil_id)||"";
   let html="";
   if(table==="data_sources"){
     html=select("source_type",sourceOptions)+field("description","真实来源或生成规则说明");
   }else if(table==="airfoils"){
     html=[
-      field("airfoil_id","如 naca0012"),
+      field("airfoil_id","如 naca0012",newId),
       field("name","翼型名称"),
       field("source","UIUC / Frontend Input","Frontend Input"),
       field("family","系列","Manual"),
       select("source_type",sourceOptions),
-      field("source_file","来源文件","frontend\\new_airfoil.dat"),
+      field("source_file","来源文件",`frontend\\${newId}.dat`),
       field("original_point_count","原始点数","1"),
       field("final_point_count","最终点数","1"),
     ].join("");
   }else if(table==="data_versions"){
     html=[
       select("airfoil_id",airfoilOptions||`<option value="">请先加载 airfoils</option>`),
-      field("version_id","版本号","1"),
+      field("version_id","版本号","99"),
       select("version_type",`<option value="imported_raw">imported_raw</option><option value="augmented_from_raw">augmented_from_raw</option>`),
       select("coordinate_source_type",`<option value="real_only">real_only</option><option value="mixed_real_and_augmented">mixed_real_and_augmented</option>`),
       field("description","版本说明","Frontend created data version"),
@@ -6346,7 +6650,7 @@ function renderMainAddForm(visible){
     html=[
       select("airfoil_id",airfoilOptions||`<option value="">请先加载 airfoils</option>`),
       field("version_id","版本号","1"),
-      field("point_order","点序号","1"),
+      field("point_order","点序号","9999"),
       field("x","x 坐标","0.0"),
       field("y","y 坐标","0.0"),
       select("surface",`<option value="upper">upper</option><option value="lower">lower</option>`),
@@ -6361,6 +6665,19 @@ function renderMainAddForm(visible){
   $("submitMainAddBtn").addEventListener("click",submitMainAddForm);
 }
 function attachMainAddFieldBehaviors(table){
+  if(table==="airfoils"){
+    const idInput=document.querySelector('.mainAddInput[data-field="airfoil_id"]');
+    const sourceFile=document.querySelector('.mainAddInput[data-field="source_file"]');
+    if(idInput&&sourceFile){
+      const sync=()=>{
+        const id=idInput.value.trim().toLowerCase().replace(/[^a-z0-9_]/g,"_");
+        if(id)sourceFile.value=`frontend\\${id}.dat`;
+      };
+      idInput.addEventListener("input",sync);
+      sync();
+    }
+    return;
+  }
   if(table!=="coordinate_points")return;
   const pointSource=document.querySelector('.mainAddInput[data-field="point_source"]');
   const isAugmented=document.querySelector('.mainAddInput[data-field="is_augmented"]');
@@ -6539,6 +6856,17 @@ function attachMainTableRowActions(){
       const table=button.dataset.table;
       const row=JSON.parse(button.dataset.row||"{}");
       softDeleteMainRecord(table,row);
+    });
+  });
+  document.querySelectorAll(".rowAdminTraceBtn").forEach(button=>{
+    button.addEventListener("click",()=>{
+      const table=button.dataset.table;
+      const reviewTable=button.dataset.reviewTable||"audit_logs";
+      const row=JSON.parse(button.dataset.row||"{}");
+      const presets={};
+      tablePrimaryKeyColumns(table).forEach(column=>presets[column]=String(row[column]??""));
+      $("adminAuditTargetSelect").value=table;
+      openAdminReviewTable(reviewTable,{filters:presets});
     });
   });
 }
@@ -6989,7 +7317,11 @@ async function selectAirfoil(id){
   state.versions=data.versions||[];
   const a=data.airfoil;
   $("airfoilTitle").textContent=`${a.airfoil_id} · ${a.name}`;
-  $("airfoilMeta").textContent=`${a.source_type} · ${a.source_file} · original ${a.original_point_count}, final ${a.final_point_count}`;
+  $("airfoilMeta").innerHTML=[
+    `<span><b>数据来源类型：</b>${escapeHtml(a.source_type||"-")}</span>`,
+    `<span><b>源文件路径：</b>${escapeHtml(a.source_file||"-")}</span>`,
+    `<span><b>坐标点数量：</b>原始 ${escapeHtml(a.original_point_count)}，最终 ${escapeHtml(a.final_point_count)}</span>`
+  ].join("<br>");
   $("versionSelect").innerHTML=state.versions.map(v=>`<option value="${v.version_id}">version ${v.version_id} · ${v.version_type}</option>`).join("");
   if(!state.versions.length){
     state.coordinates=[];
@@ -7298,9 +7630,16 @@ function drawShape(){
   state.shapeScreen=[];
   if(!pts.length){drawAxes(ctx,w,h);return;}
   const minX=Math.min(...pts.map(p=>p.x)),maxX=Math.max(...pts.map(p=>p.x)),minY=Math.min(...pts.map(p=>p.y)),maxY=Math.max(...pts.map(p=>p.y));
+  const rawXRange=maxX-minX||1;
+  const rawYRange=maxY-minY||1;
   const ax=drawAxes(ctx,w,h,minX,maxX,minY,maxY);
-  const sx=x=>ax.left+(x-minX)/(maxX-minX||1)*ax.plotW;
-  const sy=y=>ax.top+ax.plotH-(y-minY)/(maxY-minY||1)*ax.plotH;
+  const scale=Math.min(ax.plotW/rawXRange,ax.plotH/rawYRange);
+  const drawnW=rawXRange*scale;
+  const drawnH=rawYRange*scale;
+  const offsetX=ax.left+(ax.plotW-drawnW)/2;
+  const offsetY=ax.top+(ax.plotH-drawnH)/2;
+  const sx=x=>offsetX+(x-minX)*scale;
+  const sy=y=>offsetY+drawnH-(y-minY)*scale;
   const colors={upper:"#1f766f",lower:"#2563a6",unknown:"#526071"};
   const hasAnomaly=state.anomalies&&state.anomalies.length>0;
   pts.forEach(p=>state.shapeScreen.push({...p,sx:sx(p.x),sy:sy(p.y)}));
