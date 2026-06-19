@@ -265,6 +265,34 @@ def current_record_version_id(table_name: str, record_pk: str) -> int:
     return int(rows[0].get("record_version_id") or 0)
 
 
+def log_audit_change(
+    table_name: str,
+    operation_type: str,
+    record_pk: str,
+    previous_record_version_id: int | None,
+    record_version_id: int,
+    old_values: dict[str, Any] | None,
+    new_values: dict[str, Any] | None,
+) -> None:
+    ensure_audit_schema()
+    execute_write(
+        """
+        INSERT INTO audit_logs
+            (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            table_name,
+            operation_type,
+            record_pk,
+            previous_record_version_id,
+            record_version_id,
+            None if old_values is None else json.dumps(old_values, ensure_ascii=False, default=str),
+            None if new_values is None else json.dumps(new_values, ensure_ascii=False, default=str),
+        ),
+    )
+
+
 def log_data_import(
     target_table: str,
     record_pk: str,
@@ -662,12 +690,7 @@ def ensure_airfoil_schema() -> None:
         GROUP BY INDEX_NAME
         """
     )
-    if not any(
-        row.get("index_name") == "uq_airfoils_id_source_file"
-        and str(row.get("columns") or "") == "airfoil_id,source_file"
-        and int(row.get("non_unique") or 1) == 0
-        for row in refreshed
-    ):
+    if not any(row.get("index_name") == "uq_airfoils_id_source_file" for row in refreshed):
         execute_write("ALTER TABLE airfoils ADD UNIQUE KEY uq_airfoils_id_source_file (airfoil_id, source_file)")
     _AIRFOIL_SCHEMA_READY = True
 
@@ -1992,10 +2015,15 @@ def admin_main_table() -> Any:
         return jsonify({"error": "table has no visible columns"}), 400
 
     include_options = request.args.get("include_options", "0") == "1"
+    include_deleted = request.args.get("include_deleted", "0") == "1" and role == "admin"
     filter_columns = [column for column in MAIN_TABLE_KEY_FILTERS.get(table_name, []) if column in columns]
     filter_options: dict[str, list[Any]] = {}
     if include_options:
-        option_soft_filter = f" AND {soft_delete_filter_sql(table_name)}" if table_name in SOFT_DELETE_TARGET_TABLES else ""
+        option_soft_filter = (
+            f" AND {soft_delete_filter_sql(table_name)}"
+            if table_name in SOFT_DELETE_TARGET_TABLES and not include_deleted
+            else ""
+        )
         for column in filter_columns:
             filter_options[column] = [
                 row["value"]
@@ -2026,7 +2054,7 @@ def admin_main_table() -> Any:
             else:
                 where_parts.append(f"CAST(`{column}` AS CHAR) = %s")
                 params.append(value)
-    if table_name in SOFT_DELETE_TARGET_TABLES:
+    if table_name in SOFT_DELETE_TARGET_TABLES and not include_deleted:
         where_parts.append(soft_delete_filter_sql(table_name))
     where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
 
@@ -2046,6 +2074,7 @@ def admin_main_table() -> Any:
             "filter_columns": filter_columns,
             "filter_options": filter_options,
             "filters": filters,
+            "include_deleted": include_deleted,
             "rows": rows,
         }
     )
@@ -2220,6 +2249,7 @@ def update_airfoil_record() -> Any:
         return jsonify({"error": "point counts must be positive and final_point_count >= original_point_count"}), 400
 
     start = time.perf_counter()
+    old_rows = query_all("SELECT * FROM airfoils WHERE airfoil_id = %s", (airfoil_id,))
     try:
         affected = execute_write(
             """
@@ -2255,6 +2285,30 @@ def update_airfoil_record() -> Any:
 
     rows = query_all("SELECT * FROM airfoils WHERE airfoil_id = %s", (airfoil_id,))
     mark_lineage_modified("airfoils", airfoil_id, airfoil_id, "master", user)
+    if old_rows and rows and affected:
+        version_rows = query_all(
+            """
+            SELECT previous_record_version_id, record_version_id
+            FROM data_record_lineage
+            WHERE table_name = 'airfoils' AND record_pk = %s
+            LIMIT 1
+            """,
+            (airfoil_id,),
+        )
+        previous_version = None
+        record_version = 0
+        if version_rows:
+            previous_version = version_rows[0].get("previous_record_version_id")
+            record_version = int(version_rows[0].get("record_version_id") or 0)
+        log_audit_change(
+            "airfoils",
+            "UPDATE",
+            airfoil_id,
+            previous_version,
+            record_version,
+            old_rows[0],
+            rows[0],
+        )
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     log_user_action(user["user_id"], f"Updated airfoil {airfoil_id}", "UPDATE airfoils", 1 if affected else 0, elapsed_ms)
     return jsonify({"affected_rows": affected, "elapsed_ms": elapsed_ms, "rows": rows})
@@ -3720,6 +3774,29 @@ def soft_delete_main_record() -> Any:
                     user["username"],
                 ),
             )
+        execute_write(
+            """
+            INSERT INTO audit_logs
+                (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
+            VALUES (%s, 'DELETE', %s, %s, %s, %s, JSON_OBJECT(
+                'logical_delete', TRUE,
+                'is_active', 1,
+                'delete_reason', %s,
+                'deleted_by_user_id', %s,
+                'deleted_by_username', %s
+            ))
+            """,
+            (
+                table_name,
+                record_pk,
+                delete_record_version_id - 1,
+                delete_record_version_id,
+                row_snapshot,
+                reason or "frontend logical delete",
+                user["user_id"],
+                user["username"],
+            ),
+        )
         mark_lineage_deleted(table_name, record_pk, airfoil_id, source_version, user)
     except pymysql.MySQLError as exc:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -3772,6 +3849,8 @@ def restore_main_record() -> Any:
     table_name = record["table_name"]
     record_pk = record["record_pk"]
     version_id = record.get("version_id")
+    restore_previous_version_id = current_record_version_id(table_name, record_pk)
+    restore_record_version_id = restore_previous_version_id + 1
     source_version = "source"
     if table_name == "airfoils":
         source_version = "master"
@@ -3789,6 +3868,25 @@ def restore_main_record() -> Any:
             WHERE delete_id = %s AND is_active = 1
             """,
             (user["user_id"], user["username"], delete_id),
+        )
+        execute_write(
+            """
+            INSERT INTO audit_logs
+                (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
+            VALUES (%s, 'UPDATE', %s, %s, %s,
+                    JSON_OBJECT('logical_delete', TRUE, 'is_active', 1),
+                    JSON_OBJECT('logical_delete', FALSE, 'is_active', 0,
+                                'restored_by_user_id', %s,
+                                'restored_by_username', %s))
+            """,
+            (
+                table_name,
+                record_pk,
+                restore_previous_version_id,
+                restore_record_version_id,
+                user["user_id"],
+                user["username"],
+            ),
         )
         mark_lineage_restored(table_name, record_pk, record.get("airfoil_id"), source_version, user)
     except pymysql.MySQLError as exc:
@@ -5297,6 +5395,12 @@ INDEX_HTML = r"""
     .compareScroll canvas,.versionDiffScroll canvas { display:block; border:0; border-radius:0; }
     .versionInfoSection { grid-column:1 / -1; }
     .anomalySection { grid-column:1 / -1; min-height:260px; }
+    .shapeSection { height:370px; grid-template-rows:auto auto minmax(0,1fr); }
+    .shapeLegend { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; margin:2px 0 10px; padding:8px 10px; border:1px solid rgba(29,79,72,.12); border-radius:6px; background:rgba(255,253,250,.82); color:#435046; font-size:13px; }
+    .legendItem { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; font-weight:700; }
+    .legendMark { width:22px; height:0; border-top:3px solid currentColor; display:inline-block; }
+    .legendDiamond { width:9px; height:9px; display:inline-block; background:currentColor; transform:rotate(45deg); }
+    .legendRing { width:10px; height:10px; display:inline-block; border:2px solid currentColor; border-radius:50%; background:transparent; }
     canvas { width:100%; height:100%; border:1px solid var(--line); border-radius:6px; background:#fffdfa; }
     .chartTooltip {
       position:absolute;
@@ -5329,6 +5433,11 @@ INDEX_HTML = r"""
     .metric span { color:var(--muted); font-size:13px; }
     .versionContent { min-height:0; overflow:auto; display:grid; align-content:start; gap:12px; }
     .experiment { border-top:1px solid var(--line); padding-top:12px; display:grid; gap:10px; }
+    #pageDbObjects,
+    #pageDbObjects .experiment {
+      min-width:0;
+      max-width:100%;
+    }
     .indexSqlPanel { min-height:0; display:grid; grid-template-rows:auto auto auto minmax(0,1fr); gap:10px; }
     .experimentControls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
     .iconAction { min-width:42px; font-size:22px; font-weight:700; line-height:1; }
@@ -5410,16 +5519,12 @@ INDEX_HTML = r"""
     .txnSvg .laneLabel { fill:#172033; font-weight:700; font-size:13px; }
     .txnSvg .axis { stroke:#cfd8e6; stroke-width:1; }
     .txnSvg .gridLine { stroke:#e6ebf2; stroke-width:1; }
-    .txnSvg .eventBar { fill:#1f766f; opacity:.95; }
-    .txnSvg .eventPoint { fill:#fffdfa; stroke:#1f766f; stroke-width:2.6; }
-    .txnSvg .eventCommit { fill:#2f7a39; stroke:#2f7a39; }
-    .txnSvg .eventRollback { fill:#b46f19; stroke:#b46f19; }
-    .txnSvg .eventFailed { fill:#b42318; stroke:#b42318; }
-    .txnLegend { display:flex; flex-wrap:wrap; gap:12px; align-items:center; color:var(--muted); font-size:12px; margin:4px 0 0 160px; }
-    .txnLegend span { display:inline-flex; align-items:center; gap:5px; }
-    .txnLegend i { width:10px; height:10px; border-radius:50%; display:inline-block; background:#1f766f; }
+    .txnSvg .txnDurationBar { fill:#1f766f; opacity:.92; filter:drop-shadow(0 2px 3px rgba(31,118,111,.25)); }
     #transactionResult { max-height:none; min-height:300px; }
     #dbObjectResult {
+      width:100%;
+      max-width:100%;
+      min-width:0;
       max-height:none;
       min-height:520px;
       overflow:visible;
@@ -5428,9 +5533,12 @@ INDEX_HTML = r"""
       line-height:1.55;
     }
     #dbObjectResult .tableWrap {
+      width:100%;
+      max-width:100%;
+      min-width:0;
+      display:block;
       max-height:none;
-      overflow-x:auto;
-      overflow-y:visible;
+      overflow:auto;
       padding-bottom:10px;
       scrollbar-gutter:stable both-edges;
     }
@@ -5469,6 +5577,14 @@ INDEX_HTML = r"""
       font-size:12px;
       line-height:1.5;
       color:#172033;
+    }
+    #dbObjectResult .sqlBlock pre,
+    #governanceResult .sqlBlock pre {
+      white-space:pre-wrap;
+      overflow-x:auto;
+      overflow-wrap:anywhere;
+      word-break:break-word;
+      font-family:Consolas,var(--mono);
     }
     #adminReviewFilterBox { display:none; margin-bottom:10px; }
     #adminReviewFilterBox.visible { display:grid; }
@@ -6015,6 +6131,28 @@ function isManager(){const u=state.currentUser; return u&&(u.role==="engineer"||
 function isAdmin(){return state.currentUser&&state.currentUser.role==="admin";}
 function canUseMainData(){const u=state.currentUser; return u&&(u.role==="analyst"||u.role==="engineer"||u.role==="admin");}
 function escapeHtml(value){return String(value??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));}
+function formatSqlForDisplay(sql){
+  let text=String(sql??"").replace(/\r\n/g,"\n").replace(/\s+/g," ").trim();
+  const breaks=[
+    "CREATE VIEW","CREATE TRIGGER","CREATE PROCEDURE","SQL SECURITY"," AS SELECT "," SELECT "," FROM "," LEFT JOIN "," RIGHT JOIN "," INNER JOIN "," JOIN ",
+    " WHERE "," GROUP BY "," ORDER BY "," HAVING "," LIMIT "," VALUES "," SET "," ON DUPLICATE KEY UPDATE "," BEGIN "," END"," INSERT INTO "," UPDATE "," DELETE FROM ",
+    " AND "," OR "
+  ];
+  breaks.forEach(keyword=>{
+    const escaped=keyword.trim().replace(/[.*+?^${}()|[\]\\]/g,"\\$&").replace(/\s+/g,"\\s+");
+    const pattern=new RegExp(`\\s+${escaped}\\s+`,"gi");
+    const replacement=`\n${keyword.trim()} `;
+    text=text.replace(pattern,replacement);
+  });
+  text=text
+    .replace(/,\s*/g,",\n    ")
+    .replace(/\(\s*SELECT\s+/gi,"(\nSELECT ")
+    .replace(/\)\s*SELECT\s+/gi,")\nSELECT ")
+    .replace(/\n{3,}/g,"\n\n")
+    .trim();
+  return text;
+}
+function sqlPre(sql){return `<pre>${escapeHtml(formatSqlForDisplay(sql))}</pre>`;}
 function rowsToTable(rows,options={}){
   if(!rows||!rows.length)return "<div class='status'>No rows</div>";
   const cols=Object.keys(rows[0]);
@@ -6341,7 +6479,7 @@ async function runDataGovernance(scenario){
     if(d.sql_blocks&&d.sql_blocks.length){
       pieces.push("<h2>实验 SQL</h2>");
       d.sql_blocks.forEach((block,index)=>{
-        pieces.push(`<div class="sqlBlock"><div class="status"><b>SQL ${index+1}：</b>${escapeHtml(block.title||"")}</div><pre>${escapeHtml(block.sql||"")}</pre></div>`);
+        pieces.push(`<div class="sqlBlock"><div class="status"><b>SQL ${index+1}：</b>${escapeHtml(block.title||"")}</div>${sqlPre(block.sql||"")}</div>`);
       });
     }
     (d.sections||[]).forEach(section=>{
@@ -6419,8 +6557,8 @@ async function loadAdminReviewFilters(table){
   document.querySelectorAll(".adminReviewPkFilter").forEach(input=>previous[input.dataset.pkColumn]=input.value);
   document.querySelectorAll(".adminReviewExtraFilter").forEach(input=>previous[input.dataset.filterColumn]=input.value);
   box.classList.add("visible");
-  box.innerHTML=`<div class="status">正在加载 ${escapeHtml(target)} 主键筛选项...</div>`;
-  const meta=await getJson(`/api/admin/main_table?table=${encodeURIComponent(target)}&limit=1&include_options=1`);
+  box.innerHTML=`<div class="status">正在加载 ${escapeHtml(target)} 主键筛选项（包含逻辑删除记录）...</div>`;
+  const meta=await getJson(`/api/admin/main_table?table=${encodeURIComponent(target)}&limit=1&include_options=1&include_deleted=1`);
   const pkColumns=tablePrimaryKeyColumns(target);
   const options=meta.filter_options||{};
   const pkHtml=pkColumns.map(column=>{
@@ -6549,6 +6687,7 @@ function invalidateMainTableFilters(table=null){
 }
 async function refreshAdminReviewAfterMutation(table){
   if(!isAdmin()||!state.adminReviewTable)return;
+  if(!$("pageAdmin")?.classList.contains("active"))return;
   const target=$("adminAuditTargetSelect")?.value||"";
   if(table&&target&&table!==target&&!["airfoils","data_versions","coordinate_points","performance_records","anomaly_records","data_sources"].includes(target))return;
   const presets={};
@@ -6574,7 +6713,9 @@ async function refreshMainDataAfterMutation(options={}){
     await loadMainTableFilters();
     await loadMainTable();
   }
-  await refreshAdminReviewAfterMutation(table);
+  if(options.refreshAdminReview!==false){
+    await refreshAdminReviewAfterMutation(table);
+  }
   if(state.selectedAirfoil&&options.reloadVersion!==false){
     loadVersionData().catch(err=>console.error(err));
   }
@@ -7204,16 +7345,7 @@ function transactionTimelineChart(data){
   if(!events.length)return `<div class="status">No timeline events.</div>`;
   const total=Math.max(Number(data.elapsed_ms||0),...events.map(e=>e.at_ms+Math.max(e.elapsed_ms,0.1)),1);
   const lanes=[...new Map(events.map(e=>[`${e.queue_step}:${e.transaction}`,{queue_step:e.queue_step,transaction:e.transaction}])).values()];
-  const eventKind=e=>{
-    const event=String(e.event||"").toLowerCase();
-    if(String(e.status||"")==="failed")return "failed";
-    if(event.includes("commit"))return "commit";
-    if(event.includes("rollback"))return "rollback";
-    if(event.includes("begin"))return "begin";
-    return "sql";
-  };
-  const colorClass=kind=>kind==="commit"?"eventCommit":kind==="rollback"?"eventRollback":kind==="failed"?"eventFailed":"";
-  const svgW=1040, left=160, right=28, top=34, laneH=50, plotW=svgW-left-right;
+  const svgW=1040, left=160, right=28, top=34, laneH=48, plotW=svgW-left-right;
   const svgH=top+lanes.length*laneH+42;
   const x=ms=>left+(Math.max(0,Math.min(total,ms))/total)*plotW;
   const ticks=[0,total/4,total/2,total*3/4,total];
@@ -7221,17 +7353,14 @@ function transactionTimelineChart(data){
   const lanesHtml=lanes.map((lane,laneIndex)=>{
     const cy=top+laneIndex*laneH+26;
     const laneEvents=events.filter(e=>e.queue_step===lane.queue_step&&e.transaction===lane.transaction);
-    const blocks=laneEvents.map(e=>{
-      const kind=eventKind(e),klass=colorClass(kind),startX=x(e.at_ms),barW=e.elapsed_ms?Math.max(5,(e.elapsed_ms/total)*plotW):0;
-      const title=`${e.transaction} · ${e.event} · at ${num(e.at_ms,3)} ms${e.elapsed_ms?` · ${num(e.elapsed_ms,3)} ms`:""}${e.detail?` · ${e.detail}`:""}`;
-      if(barW){
-        return `<g><title>${escapeHtml(title)}</title><rect class="eventBar ${klass}" x="${startX}" y="${cy-7}" width="${barW}" height="14" rx="7"></rect><circle class="eventPoint ${klass}" cx="${startX}" cy="${cy}" r="4"></circle></g>`;
-      }
-      return `<g><title>${escapeHtml(title)}</title><circle class="eventPoint ${klass}" cx="${startX}" cy="${cy}" r="5"></circle></g>`;
-    }).join("");
-    return `<g><text class="laneLabel" x="12" y="${cy+4}">T${lane.queue_step}: ${escapeHtml(lane.transaction)}</text><line class="axis" x1="${left}" y1="${cy}" x2="${svgW-right}" y2="${cy}"></line>${blocks}</g>`;
+    const start=Math.min(...laneEvents.map(e=>e.at_ms));
+    const end=Math.max(...laneEvents.map(e=>e.at_ms+Math.max(e.elapsed_ms,0)));
+    const startX=x(start);
+    const barW=Math.max(8,x(end)-startX);
+    const title=`${lane.transaction} · start ${num(start,3)} ms · end ${num(end,3)} ms · duration ${num(end-start,3)} ms`;
+    return `<g><text class="laneLabel" x="12" y="${cy+4}">T${lane.queue_step}: ${escapeHtml(lane.transaction)}</text><line class="axis" x1="${left}" y1="${cy}" x2="${svgW-right}" y2="${cy}"></line><g><title>${escapeHtml(title)}</title><rect class="txnDurationBar" x="${startX}" y="${cy-9}" width="${barW}" height="18" rx="9"></rect></g></g>`;
   }).join("");
-  return `<div class="txnChartWrap"><svg class="txnSvg" viewBox="0 0 ${svgW} ${svgH}" role="img" aria-label="Transaction timeline">${grid}${lanesHtml}</svg><div class="txnLegend"><span><i style="background:#1f766f"></i>BEGIN / SQL</span><span><i style="background:#2f7a39"></i>COMMIT</span><span><i style="background:#b46f19"></i>ROLLBACK</span><span><i style="background:#b42318"></i>FAILED</span></div></div>`;
+  return `<div class="txnChartWrap"><svg class="txnSvg" viewBox="0 0 ${svgW} ${svgH}" role="img" aria-label="Transaction duration timeline">${grid}${lanesHtml}</svg></div>`;
 }
 function renderTransactionTimeline(data){
   const pieces=[
@@ -7290,10 +7419,10 @@ async function runDbObjectExperiment(scenario){
     document.querySelectorAll(".dbObjectBtn").forEach(b=>b.classList.toggle("primary",b.dataset.scenario===scenario));
     const d=await postJson("/api/db_object_experiment/run",{scenario});
     const dbObjectDefinitionHtml=(d.definition_blocks&&d.definition_blocks.length)
-      ? `<h2>对象定义 SQL</h2><div class="status">下面展示本场景依赖的视图、触发器或存储过程定义。点击标题可展开查看代码。</div>${d.definition_blocks.map((block,index)=>`<details class="sqlBlock"><summary>对象 ${index+1}：${escapeHtml(block.title||"")}</summary><pre>${escapeHtml(block.sql||"")}</pre></details>`).join("")}`
+      ? `<h2>对象定义 SQL</h2><div class="status">下面展示本场景依赖的视图、触发器或存储过程定义。点击标题可展开查看代码。</div>${d.definition_blocks.map((block,index)=>`<details class="sqlBlock"><summary>对象 ${index+1}：${escapeHtml(block.title||"")}</summary>${sqlPre(block.sql||"")}</details>`).join("")}`
       : "";
     const dbObjectSqlBlocksHtml=(d.sql_blocks&&d.sql_blocks.length)
-      ? `<h2>实验执行 SQL</h2>${d.sql_blocks.map((block,index)=>`<details class="sqlBlock" open><summary>SQL ${index+1}：${escapeHtml(block.title||"")}</summary><pre>${escapeHtml(block.sql||"")}</pre></details>`).join("")}`
+      ? `<h2>实验执行 SQL</h2>${d.sql_blocks.map((block,index)=>`<details class="sqlBlock" open><summary>SQL ${index+1}：${escapeHtml(block.title||"")}</summary>${sqlPre(block.sql||"")}</details>`).join("")}`
       : "";
     const pieces=[`<div class="status">Scenario=${escapeHtml(d.scenario)} · Time=${d.elapsed_ms} ms</div>`];
     (d.sections||[]).forEach(section=>{
@@ -7304,7 +7433,7 @@ async function runDbObjectExperiment(scenario){
     if(dbObjectSqlBlocksHtml)pieces.splice(1,0,dbObjectSqlBlocksHtml);
     if(dbObjectDefinitionHtml)pieces.splice(1,0,dbObjectDefinitionHtml);
     $("dbObjectResult").innerHTML=pieces.join("");
-    await refreshMainDataAfterMutation({allTables:true});
+    await refreshMainDataAfterMutation({allTables:true,refreshAdminReview:false});
   }catch(e){
     $("dbObjectResult").textContent=`Experiment failed: ${e.error||"unknown error"}`;
   }
