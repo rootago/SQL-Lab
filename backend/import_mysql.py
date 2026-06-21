@@ -42,7 +42,7 @@ CREATE_TABLES_SQL = [
         has_augmented_coordinates TINYINT NOT NULL,
         original_point_count INT NOT NULL,
         final_point_count INT NOT NULL,
-        UNIQUE KEY uq_airfoils_source_file (source_file),
+        UNIQUE KEY uq_airfoils_id_source_file (airfoil_id, source_file),
         CONSTRAINT fk_airfoils_source_type
             FOREIGN KEY (source_type) REFERENCES data_sources(source_type),
         CHECK (is_generated IN (0, 1)),
@@ -218,6 +218,8 @@ CREATE_TABLES_SQL = [
         table_name VARCHAR(64) NOT NULL,
         operation_type VARCHAR(16) NOT NULL,
         record_pk VARCHAR(128) NOT NULL,
+        previous_record_version_id INT NULL,
+        record_version_id INT NOT NULL DEFAULT 0,
         old_values JSON,
         new_values JSON,
         changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -231,6 +233,8 @@ CREATE_TABLES_SQL = [
         record_pk VARCHAR(191) NOT NULL,
         airfoil_id VARCHAR(64),
         source_version VARCHAR(64) NOT NULL,
+        record_version_id INT NOT NULL DEFAULT 0,
+        previous_record_version_id INT NULL,
         written_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         is_modified TINYINT NOT NULL DEFAULT 0,
         last_modified_at TIMESTAMP NULL,
@@ -241,6 +245,7 @@ CREATE_TABLES_SQL = [
         UNIQUE KEY uq_data_record_lineage_record (table_name, record_pk),
         INDEX idx_data_record_lineage_table (table_name),
         INDEX idx_data_record_lineage_airfoil (airfoil_id),
+        INDEX idx_data_record_lineage_version (table_name, record_pk, record_version_id),
         CHECK (is_modified IN (0, 1)),
         CHECK (modified_count >= 0),
         CHECK (last_operation IN ('INSERT', 'UPDATE', 'DELETE'))
@@ -258,6 +263,8 @@ CREATE_TABLES_SQL = [
         created_by_user_id INT NULL,
         created_by_username VARCHAR(64) NULL,
         description TEXT,
+        previous_record_version_id INT NULL,
+        record_version_id INT NOT NULL DEFAULT 0,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE KEY uq_data_import_record_method (target_table, record_pk, entry_method),
         INDEX idx_data_import_target (target_table),
@@ -322,6 +329,56 @@ TRIGGERS_SQL = [
     END
     """,
     """
+    CREATE TRIGGER trg_audit_airfoils_update
+        AFTER UPDATE ON airfoils
+        FOR EACH ROW
+        FOLLOWS trg_lineage_airfoils_update
+        BEGIN
+            INSERT INTO audit_logs
+                (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
+            VALUES
+                (
+                    'airfoils',
+                    'UPDATE',
+                    NEW.airfoil_id,
+                    COALESCE(
+                        (SELECT previous_record_version_id FROM data_record_lineage
+                         WHERE table_name = 'airfoils' AND record_pk = NEW.airfoil_id LIMIT 1),
+                        0
+                    ),
+                    COALESCE(
+                        (SELECT record_version_id FROM data_record_lineage
+                         WHERE table_name = 'airfoils' AND record_pk = NEW.airfoil_id LIMIT 1),
+                        1
+                    ),
+                    JSON_OBJECT(
+                        'airfoil_id', OLD.airfoil_id,
+                        'name', OLD.name,
+                        'source', OLD.source,
+                        'family', OLD.family,
+                        'is_generated', OLD.is_generated,
+                        'source_type', OLD.source_type,
+                        'source_file', OLD.source_file,
+                        'has_augmented_coordinates', OLD.has_augmented_coordinates,
+                        'original_point_count', OLD.original_point_count,
+                        'final_point_count', OLD.final_point_count
+                    ),
+                    JSON_OBJECT(
+                        'airfoil_id', NEW.airfoil_id,
+                        'name', NEW.name,
+                        'source', NEW.source,
+                        'family', NEW.family,
+                        'is_generated', NEW.is_generated,
+                        'source_type', NEW.source_type,
+                        'source_file', NEW.source_file,
+                        'has_augmented_coordinates', NEW.has_augmented_coordinates,
+                        'original_point_count', NEW.original_point_count,
+                        'final_point_count', NEW.final_point_count
+                    )
+                );
+        END
+        """,
+        """
     CREATE TRIGGER trg_lineage_data_versions_insert
     AFTER INSERT ON data_versions
     FOR EACH ROW
@@ -479,14 +536,35 @@ TRIGGERS_SQL = [
     CREATE TRIGGER trg_audit_performance_update
     AFTER UPDATE ON performance_records
     FOR EACH ROW
+    FOLLOWS trg_lineage_performance_update
     BEGIN
         INSERT INTO audit_logs
-            (table_name, operation_type, record_pk, old_values, new_values)
+            (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
         VALUES
             (
                 'performance_records',
                 'UPDATE',
                 CAST(OLD.perf_id AS CHAR),
+                COALESCE(
+                    (
+                        SELECT previous_record_version_id
+                        FROM data_record_lineage
+                        WHERE table_name = 'performance_records'
+                          AND record_pk = CAST(OLD.perf_id AS CHAR)
+                        LIMIT 1
+                    ),
+                    0
+                ),
+                COALESCE(
+                    (
+                        SELECT record_version_id
+                        FROM data_record_lineage
+                        WHERE table_name = 'performance_records'
+                          AND record_pk = CAST(OLD.perf_id AS CHAR)
+                        LIMIT 1
+                    ),
+                    1
+                ),
                 JSON_OBJECT(
                     'cl', OLD.cl,
                     'cd', OLD.cd,

@@ -22,8 +22,6 @@ _AUTH_SCHEMA_READY = False
 _SAVED_TRANSACTION_SCHEMA_READY = False
 _LINEAGE_SCHEMA_READY = False
 _IMPORT_SCHEMA_READY = False
-_AUDIT_SCHEMA_READY = False
-_AIRFOIL_SCHEMA_READY = False
 _SOFT_DELETE_SCHEMA_READY = False
 _ANOMALY_TRIGGER_SCHEMA_READY = False
 _PERFORMANCE_TRIGGER_SCHEMA_READY = False
@@ -265,34 +263,6 @@ def current_record_version_id(table_name: str, record_pk: str) -> int:
     return int(rows[0].get("record_version_id") or 0)
 
 
-def log_audit_change(
-    table_name: str,
-    operation_type: str,
-    record_pk: str,
-    previous_record_version_id: int | None,
-    record_version_id: int,
-    old_values: dict[str, Any] | None,
-    new_values: dict[str, Any] | None,
-) -> None:
-    ensure_audit_schema()
-    execute_write(
-        """
-        INSERT INTO audit_logs
-            (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            table_name,
-            operation_type,
-            record_pk,
-            previous_record_version_id,
-            record_version_id,
-            None if old_values is None else json.dumps(old_values, ensure_ascii=False, default=str),
-            None if new_values is None else json.dumps(new_values, ensure_ascii=False, default=str),
-        ),
-    )
-
-
 def log_data_import(
     target_table: str,
     record_pk: str,
@@ -303,14 +273,12 @@ def log_data_import(
     source_type: str | None = None,
     description: str | None = None,
 ) -> None:
-    record_version_id = current_record_version_id(target_table, record_pk)
     execute_write(
         """
         INSERT INTO data_import_records
             (target_table, record_pk, airfoil_id, version_id, source_type,
-             entry_method, created_by_user_id, created_by_username, description,
-             previous_record_version_id, record_version_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
+             entry_method, created_by_user_id, created_by_username, description)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             airfoil_id = VALUES(airfoil_id),
             version_id = VALUES(version_id),
@@ -318,9 +286,7 @@ def log_data_import(
             created_by_user_id = VALUES(created_by_user_id),
             created_by_username = VALUES(created_by_username),
             created_at = CURRENT_TIMESTAMP,
-            description = VALUES(description),
-            previous_record_version_id = VALUES(previous_record_version_id),
-            record_version_id = VALUES(record_version_id)
+            description = VALUES(description)
         """,
         (
             target_table,
@@ -332,7 +298,6 @@ def log_data_import(
             None if user is None else user.get("user_id"),
             "system" if user is None else user.get("username"),
             description,
-            record_version_id,
         ),
     )
 
@@ -603,12 +568,8 @@ def ensure_import_schema() -> None:
             """
         )
     }
-    if "previous_record_version_id" not in import_columns:
-        execute_write("ALTER TABLE data_import_records ADD COLUMN previous_record_version_id INT NULL AFTER description")
-    if "record_version_id" not in import_columns:
-        execute_write("ALTER TABLE data_import_records ADD COLUMN record_version_id INT NOT NULL DEFAULT 0 AFTER previous_record_version_id")
-    else:
-        execute_write("ALTER TABLE data_import_records MODIFY COLUMN record_version_id INT NOT NULL DEFAULT 0")
+    if "record_version_id" in import_columns:
+        execute_write("ALTER TABLE data_import_records DROP COLUMN record_version_id")
     for sql in [
         """
         INSERT INTO data_import_records
@@ -634,65 +595,6 @@ def ensure_import_schema() -> None:
     ]:
         execute_write(sql)
     _IMPORT_SCHEMA_READY = True
-
-
-def ensure_audit_schema() -> None:
-    global _AUDIT_SCHEMA_READY
-    if _AUDIT_SCHEMA_READY:
-        return
-    audit_columns = {
-        row["column_name"]
-        for row in query_all(
-            """
-            SELECT COLUMN_NAME AS column_name
-            FROM information_schema.columns
-            WHERE table_schema = DATABASE()
-              AND table_name = 'audit_logs'
-            """
-        )
-    }
-    if "previous_record_version_id" not in audit_columns:
-        execute_write("ALTER TABLE audit_logs ADD COLUMN previous_record_version_id INT NULL AFTER record_pk")
-    if "record_version_id" not in audit_columns:
-        execute_write("ALTER TABLE audit_logs ADD COLUMN record_version_id INT NOT NULL DEFAULT 0 AFTER previous_record_version_id")
-    else:
-        execute_write("ALTER TABLE audit_logs MODIFY COLUMN record_version_id INT NOT NULL DEFAULT 0")
-    _AUDIT_SCHEMA_READY = True
-
-
-def ensure_airfoil_schema() -> None:
-    global _AIRFOIL_SCHEMA_READY
-    if _AIRFOIL_SCHEMA_READY:
-        return
-    indexes = query_all(
-        """
-        SELECT INDEX_NAME AS index_name,
-               GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns,
-               MIN(NON_UNIQUE) AS non_unique
-        FROM information_schema.statistics
-        WHERE table_schema = DATABASE()
-          AND table_name = 'airfoils'
-        GROUP BY INDEX_NAME
-        """
-    )
-    for row in indexes:
-        columns = str(row.get("columns") or "")
-        if row.get("index_name") == "uq_airfoils_source_file" and columns == "source_file" and int(row.get("non_unique") or 1) == 0:
-            execute_write("ALTER TABLE airfoils DROP INDEX uq_airfoils_source_file")
-    refreshed = query_all(
-        """
-        SELECT INDEX_NAME AS index_name,
-               GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns,
-               MIN(NON_UNIQUE) AS non_unique
-        FROM information_schema.statistics
-        WHERE table_schema = DATABASE()
-          AND table_name = 'airfoils'
-        GROUP BY INDEX_NAME
-        """
-    )
-    if not any(row.get("index_name") == "uq_airfoils_id_source_file" for row in refreshed):
-        execute_write("ALTER TABLE airfoils ADD UNIQUE KEY uq_airfoils_id_source_file (airfoil_id, source_file)")
-    _AIRFOIL_SCHEMA_READY = True
 
 
 def sync_import_records() -> None:
@@ -839,7 +741,6 @@ def ensure_core_trigger_schema() -> None:
     trigger_sql = [
         "DROP TRIGGER IF EXISTS trg_lineage_airfoils_insert",
         "DROP TRIGGER IF EXISTS trg_lineage_airfoils_update",
-        "DROP TRIGGER IF EXISTS trg_audit_airfoils_update",
         "DROP TRIGGER IF EXISTS trg_lineage_data_versions_insert",
         "DROP TRIGGER IF EXISTS trg_lineage_data_versions_update",
         "DROP TRIGGER IF EXISTS trg_lineage_coordinates_insert",
@@ -878,56 +779,6 @@ def ensure_core_trigger_schema() -> None:
                 last_modified_at = CURRENT_TIMESTAMP,
                 modified_count = modified_count + 1,
                 last_operation = 'UPDATE';
-        END
-        """,
-        """
-        CREATE TRIGGER trg_audit_airfoils_update
-        AFTER UPDATE ON airfoils
-        FOR EACH ROW
-        FOLLOWS trg_lineage_airfoils_update
-        BEGIN
-            INSERT INTO audit_logs
-                (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
-            VALUES
-                (
-                    'airfoils',
-                    'UPDATE',
-                    NEW.airfoil_id,
-                    COALESCE(
-                        (SELECT previous_record_version_id FROM data_record_lineage
-                         WHERE table_name = 'airfoils' AND record_pk = NEW.airfoil_id LIMIT 1),
-                        0
-                    ),
-                    COALESCE(
-                        (SELECT record_version_id FROM data_record_lineage
-                         WHERE table_name = 'airfoils' AND record_pk = NEW.airfoil_id LIMIT 1),
-                        1
-                    ),
-                    JSON_OBJECT(
-                        'airfoil_id', OLD.airfoil_id,
-                        'name', OLD.name,
-                        'source', OLD.source,
-                        'family', OLD.family,
-                        'is_generated', OLD.is_generated,
-                        'source_type', OLD.source_type,
-                        'source_file', OLD.source_file,
-                        'has_augmented_coordinates', OLD.has_augmented_coordinates,
-                        'original_point_count', OLD.original_point_count,
-                        'final_point_count', OLD.final_point_count
-                    ),
-                    JSON_OBJECT(
-                        'airfoil_id', NEW.airfoil_id,
-                        'name', NEW.name,
-                        'source', NEW.source,
-                        'family', NEW.family,
-                        'is_generated', NEW.is_generated,
-                        'source_type', NEW.source_type,
-                        'source_file', NEW.source_file,
-                        'has_augmented_coordinates', NEW.has_augmented_coordinates,
-                        'original_point_count', NEW.original_point_count,
-                        'final_point_count', NEW.final_point_count
-                    )
-                );
         END
         """,
         """
@@ -1165,35 +1016,14 @@ def ensure_performance_trigger_schema() -> None:
         CREATE TRIGGER trg_audit_performance_update
         AFTER UPDATE ON performance_records
         FOR EACH ROW
-        FOLLOWS trg_lineage_performance_update
         BEGIN
             INSERT INTO audit_logs
-                (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
+                (table_name, operation_type, record_pk, old_values, new_values)
             VALUES
                 (
                     'performance_records',
                     'UPDATE',
                     CAST(OLD.perf_id AS CHAR),
-                    COALESCE(
-                        (
-                            SELECT previous_record_version_id
-                            FROM data_record_lineage
-                            WHERE table_name = 'performance_records'
-                              AND record_pk = CAST(OLD.perf_id AS CHAR)
-                            LIMIT 1
-                        ),
-                        0
-                    ),
-                    COALESCE(
-                        (
-                            SELECT record_version_id
-                            FROM data_record_lineage
-                            WHERE table_name = 'performance_records'
-                              AND record_pk = CAST(OLD.perf_id AS CHAR)
-                            LIMIT 1
-                        ),
-                        1
-                    ),
                     JSON_OBJECT(
                         'cl', OLD.cl,
                         'cd', OLD.cd,
@@ -1360,8 +1190,6 @@ def before_request() -> None:
     ensure_saved_transaction_schema()
     ensure_lineage_schema()
     ensure_import_schema()
-    ensure_audit_schema()
-    ensure_airfoil_schema()
     ensure_soft_delete_schema()
     ensure_core_trigger_schema()
     ensure_performance_trigger_schema()
@@ -1559,9 +1387,9 @@ MAIN_TABLE_KEY_FILTERS = {
     "coordinate_points": ["airfoil_id", "version_id", "point_order"],
     "performance_records": ["perf_id", "airfoil_id", "version_id"],
     "anomaly_records": ["anomaly_id", "perf_id", "airfoil_id", "version_id"],
-    "audit_logs": ["audit_id", "table_name", "record_pk", "previous_record_version_id", "record_version_id"],
-    "data_record_lineage": ["lineage_id", "table_name", "record_pk", "airfoil_id", "previous_record_version_id", "record_version_id"],
-    "data_import_records": ["import_id", "target_table", "record_pk", "airfoil_id", "previous_record_version_id", "record_version_id"],
+    "audit_logs": ["audit_id", "table_name", "record_pk"],
+    "data_record_lineage": ["lineage_id", "table_name", "record_pk", "airfoil_id"],
+    "data_import_records": ["import_id", "target_table", "record_pk", "airfoil_id"],
     "soft_delete_records": ["delete_id", "table_name", "record_pk", "airfoil_id"],
     "performance_import_staging": ["staging_id", "batch_id", "perf_id"],
     "saved_transactions": ["saved_id", "user_id"],
@@ -1711,14 +1539,12 @@ def performance() -> Any:
 def performance_compare() -> Any:
     reynolds_number = int(request.args.get("reynolds_number", "50000"))
     metric = request.args.get("metric", "max_cl")
-    limit = min(max(int(request.args.get("limit", "80")), 1), 200)
     metric_sql = {
         "max_cl": "MAX(p.cl)",
         "min_cd": "MIN(p.cd)",
         "max_ld": "MAX(p.cl / NULLIF(p.cd, 0))",
         "avg_cl": "AVG(p.cl)",
     }.get(metric, "MAX(p.cl)")
-    order_dir = "ASC" if metric == "min_cd" else "DESC"
     rows = query_all(
         f"""
         SELECT p.airfoil_id, a.name, ROUND({metric_sql}, 6) AS value
@@ -1729,10 +1555,10 @@ def performance_compare() -> Any:
           AND {soft_delete_filter_sql("performance_records", "p")}
         GROUP BY p.airfoil_id, a.name
         HAVING value IS NOT NULL
-        ORDER BY value {order_dir}
-        LIMIT %s
+        ORDER BY value DESC
+        LIMIT 24
         """,
-        (reynolds_number, limit),
+        (reynolds_number,),
     )
     return jsonify(rows)
 
@@ -1793,7 +1619,22 @@ def condition_search() -> Any:
     elif include_anomaly != "1":
         where.append("p.is_anomaly = 0")
 
-    params.append(row_limit)
+    where_sql = " AND ".join(where)
+    count_rows = query_all(
+        f"""
+        SELECT COUNT(*) AS total_count
+        FROM performance_records p
+        JOIN airfoils a ON a.airfoil_id = p.airfoil_id
+        JOIN data_versions dv
+          ON dv.airfoil_id = p.airfoil_id
+         AND dv.version_id = p.version_id
+        WHERE {where_sql}
+        """,
+        tuple(params),
+    )
+    total_count = int(count_rows[0]["total_count"] or 0) if count_rows else 0
+
+    query_params = tuple([*params, row_limit])
     rows = query_all(
         f"""
         SELECT
@@ -1815,11 +1656,11 @@ def condition_search() -> Any:
         JOIN data_versions dv
           ON dv.airfoil_id = p.airfoil_id
          AND dv.version_id = p.version_id
-        WHERE {" AND ".join(where)}
+        WHERE {where_sql}
         ORDER BY p.cl DESC, lift_drag_ratio DESC, p.cd ASC, p.airfoil_id, p.version_id
         LIMIT %s
         """,
-        tuple(params),
+        query_params,
     )
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     log_user_action(
@@ -1829,13 +1670,20 @@ def condition_search() -> Any:
         1,
         elapsed_ms,
     )
-    return jsonify({"elapsed_ms": elapsed_ms, "rows": rows, "row_count": len(rows)})
+    return jsonify(
+        {
+            "elapsed_ms": elapsed_ms,
+            "rows": rows,
+            "row_count": len(rows),
+            "total_count": total_count,
+            "limit": row_limit,
+        }
+    )
 
 
 @app.get("/api/version_compare")
 def version_compare() -> Any:
     reynolds_number = int(request.args.get("reynolds_number", "50000"))
-    limit = min(max(int(request.args.get("limit", "200")), 1), 500)
     rows = query_all(
         f"""
         SELECT
@@ -1853,9 +1701,9 @@ def version_compare() -> Any:
         GROUP BY dv.airfoil_id, a.name, dv.version_id, dv.version_type
         HAVING value IS NOT NULL
         ORDER BY value DESC, dv.airfoil_id, dv.version_id
-        LIMIT %s
+        LIMIT 18
         """,
-        (reynolds_number, limit),
+        (reynolds_number,),
     )
     return jsonify(rows)
 
@@ -2029,41 +1877,6 @@ def admin_query_logs() -> Any:
     return jsonify(rows)
 
 
-def audit_record_aliases(target_table: str, record_pk: str) -> list[str]:
-    """Return all record keys connected by audited primary-key changes."""
-    aliases = {str(record_pk)}
-    if target_table != "airfoils":
-        return sorted(aliases)
-
-    for _ in range(20):
-        values = sorted(aliases)
-        placeholders = ", ".join(["%s"] * len(values))
-        rows = query_all(
-            f"""
-            SELECT record_pk,
-                   JSON_UNQUOTE(JSON_EXTRACT(old_values, '$.airfoil_id')) AS old_record_pk,
-                   JSON_UNQUOTE(JSON_EXTRACT(new_values, '$.airfoil_id')) AS new_record_pk
-            FROM audit_logs
-            WHERE table_name = 'airfoils'
-              AND (
-                    record_pk IN ({placeholders})
-                 OR JSON_UNQUOTE(JSON_EXTRACT(old_values, '$.airfoil_id')) IN ({placeholders})
-                 OR JSON_UNQUOTE(JSON_EXTRACT(new_values, '$.airfoil_id')) IN ({placeholders})
-              )
-            """,
-            tuple(values + values + values),
-        )
-        before = len(aliases)
-        for row in rows:
-            for key in ("record_pk", "old_record_pk", "new_record_pk"):
-                value = row.get(key)
-                if value:
-                    aliases.add(str(value))
-        if len(aliases) == before:
-            break
-    return sorted(aliases)
-
-
 @app.get("/api/admin/main_table")
 def admin_main_table() -> Any:
     role = current_role()
@@ -2101,15 +1914,10 @@ def admin_main_table() -> Any:
         return jsonify({"error": "table has no visible columns"}), 400
 
     include_options = request.args.get("include_options", "0") == "1"
-    include_deleted = request.args.get("include_deleted", "0") == "1" and role == "admin"
     filter_columns = [column for column in MAIN_TABLE_KEY_FILTERS.get(table_name, []) if column in columns]
     filter_options: dict[str, list[Any]] = {}
     if include_options:
-        option_soft_filter = (
-            f" AND {soft_delete_filter_sql(table_name)}"
-            if table_name in SOFT_DELETE_TARGET_TABLES and not include_deleted
-            else ""
-        )
+        option_soft_filter = f" AND {soft_delete_filter_sql(table_name)}" if table_name in SOFT_DELETE_TARGET_TABLES else ""
         for column in filter_columns:
             filter_options[column] = [
                 row["value"]
@@ -2135,37 +1943,19 @@ def admin_main_table() -> Any:
         value = request.args.get(f"filter_{column}", "").strip()
         if value:
             filters[column] = value
-            if table_name == "data_record_lineage" and column == "previous_record_version_id" and value.lower() in {"null", "none", "空"}:
-                where_parts.append("`previous_record_version_id` IS NULL")
-            elif table_name == "audit_logs" and column == "record_pk":
-                target_table = request.args.get("filter_table_name", "").strip()
-                aliases = audit_record_aliases(target_table, value)
-                placeholders = ", ".join(["%s"] * len(aliases))
-                where_parts.append(f"CAST(`record_pk` AS CHAR) IN ({placeholders})")
-                params.extend(aliases)
-                filters["record_pk_history"] = " -> ".join(aliases)
-            else:
-                where_parts.append(f"CAST(`{column}` AS CHAR) = %s")
-                params.append(value)
-    if table_name in SOFT_DELETE_TARGET_TABLES and not include_deleted:
+            where_parts.append(f"CAST(`{column}` AS CHAR) = %s")
+            params.append(value)
+    if table_name in SOFT_DELETE_TARGET_TABLES:
         where_parts.append(soft_delete_filter_sql(table_name))
     where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
 
     total = query_all(f"SELECT COUNT(*) AS count FROM `{table_name}`{where_sql}", tuple(params))[0]["count"]
-    order_column = {
-        "audit_logs": "audit_id",
-        "data_record_lineage": "lineage_id",
-        "data_import_records": "import_id",
-        "soft_delete_records": "delete_id",
-        "query_logs": "log_id",
-    }.get(table_name)
-    order_sql = f" ORDER BY `{order_column}` DESC" if order_column else ""
     if limit_arg == "all":
-        rows = query_all(f"SELECT * FROM `{table_name}`{where_sql}{order_sql}", tuple(params))
+        rows = query_all(f"SELECT * FROM `{table_name}`{where_sql}", tuple(params))
         limit: int | str = "all"
     else:
         limit = min(max(int(limit_arg), 1), 10000)
-        rows = query_all(f"SELECT * FROM `{table_name}`{where_sql}{order_sql} LIMIT %s", tuple(params + [limit]))
+        rows = query_all(f"SELECT * FROM `{table_name}`{where_sql} LIMIT %s", tuple(params + [limit]))
     return jsonify(
         {
             "table": table_name,
@@ -2175,7 +1965,6 @@ def admin_main_table() -> Any:
             "filter_columns": filter_columns,
             "filter_options": filter_options,
             "filters": filters,
-            "include_deleted": include_deleted,
             "rows": rows,
         }
     )
@@ -2199,19 +1988,6 @@ def friendly_mysql_error(exc: pymysql.MySQLError, table_name: str = "") -> str:
     code = exc.args[0] if exc.args else None
     message = str(exc)
     if code == 1062:
-        duplicated = re.search(r"Duplicate entry '([^']+)' for key '([^']+)'", message)
-        if duplicated:
-            value, key_name = duplicated.groups()
-            key_hint = key_name.split(".")[-1]
-            if "source_file" in key_hint:
-                return f"{table_name or '记录'} 创建失败：airfoil_id + source_file 组合重复（{value}）。同一翼型不能重复登记同一个源文件。"
-            if "PRIMARY" in key_hint.upper() or "airfoil_id" in key_hint:
-                return f"{table_name or '记录'} 创建失败：主键重复（{value}），数据库中已经存在这条记录。请换一个编号，或编辑已有记录。"
-            if "version" in key_hint:
-                return f"{table_name or '记录'} 创建失败：版本主键重复（{value}）。该翼型下已经存在这个 version_id，请换成更大的版本号。"
-            if "coordinate" in key_hint or "point" in key_hint:
-                return f"{table_name or '记录'} 创建失败：坐标点主键重复（{value}）。该翼型版本下已经存在这个 point_order，请换成下一点序号。"
-            return f"{table_name or '记录'} 创建失败：唯一字段 {key_hint} 重复（{value}）。"
         return f"{table_name or '记录'} 创建失败：主键或唯一字段重复，数据库中已经存在相同记录。"
     if code == 1452:
         if table_name == "coordinate_points":
@@ -2235,32 +2011,6 @@ def friendly_mysql_error(exc: pymysql.MySQLError, table_name: str = "") -> str:
                 return "coordinate_points 创建失败：真实点必须为 real + is_augmented=0 + original_coordinate；增强点必须为 augmented + is_augmented=1 + linear_interpolation。"
         return f"{table_name or '记录'} 创建失败：违反了表的 CHECK 约束，请检查字段取值范围和枚举值。"
     return message
-
-
-def airfoil_create_conflict_message(airfoil_id: str, source_file: str) -> str | None:
-    rows = query_all(
-        """
-        SELECT a.airfoil_id, a.source_file, sd.delete_id, sd.is_active
-        FROM airfoils a
-        LEFT JOIN soft_delete_records sd
-          ON sd.table_name = 'airfoils'
-         AND sd.record_pk = a.airfoil_id
-         AND sd.is_active = 1
-        WHERE a.airfoil_id = %s
-           OR (a.airfoil_id = %s AND a.source_file = %s)
-        LIMIT 5
-        """,
-        (airfoil_id, airfoil_id, source_file),
-    )
-    for row in rows:
-        if row.get("airfoil_id") == airfoil_id:
-            if int(row.get("is_active") or 0) == 1:
-                return f"airfoils 创建失败：airfoil_id={airfoil_id} 已被逻辑删除但仍保留在数据库中。请到 管理审计 -> 逻辑删除记录 中恢复，或换一个 airfoil_id。"
-            return f"airfoils 创建失败：airfoil_id={airfoil_id} 已存在。airfoils 的主键是 airfoil_id，不能重复；请编辑已有记录或换编号。"
-    for row in rows:
-        if row.get("airfoil_id") == airfoil_id and row.get("source_file") == source_file:
-            return f"airfoils 创建失败：airfoil_id={airfoil_id} 与 source_file={source_file} 的组合已存在。请编辑已有记录，或换一个 airfoil_id/source_file 组合。"
-    return None
 
 
 @app.errorhandler(pymysql.MySQLError)
@@ -2384,16 +2134,7 @@ def update_airfoil_record() -> Any:
         return jsonify({"error": str(exc)}), 400
 
     rows = query_all("SELECT * FROM airfoils WHERE airfoil_id = %s", (airfoil_id,))
-    if rows and affected:
-        execute_write(
-            """
-            UPDATE data_record_lineage
-            SET modified_by_user_id = %s,
-                modified_by_username = %s
-            WHERE table_name = 'airfoils' AND record_pk = %s
-            """,
-            (user["user_id"], user["username"], airfoil_id),
-        )
+    mark_lineage_modified("airfoils", airfoil_id, airfoil_id, "master", user)
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     log_user_action(user["user_id"], f"Updated airfoil {airfoil_id}", "UPDATE airfoils", 1 if affected else 0, elapsed_ms)
     return jsonify({"affected_rows": affected, "elapsed_ms": elapsed_ms, "rows": rows})
@@ -3859,29 +3600,6 @@ def soft_delete_main_record() -> Any:
                     user["username"],
                 ),
             )
-        execute_write(
-            """
-            INSERT INTO audit_logs
-                (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
-            VALUES (%s, 'DELETE', %s, %s, %s, %s, JSON_OBJECT(
-                'logical_delete', TRUE,
-                'is_active', 1,
-                'delete_reason', %s,
-                'deleted_by_user_id', %s,
-                'deleted_by_username', %s
-            ))
-            """,
-            (
-                table_name,
-                record_pk,
-                delete_record_version_id - 1,
-                delete_record_version_id,
-                row_snapshot,
-                reason or "frontend logical delete",
-                user["user_id"],
-                user["username"],
-            ),
-        )
         mark_lineage_deleted(table_name, record_pk, airfoil_id, source_version, user)
     except pymysql.MySQLError as exc:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -3934,8 +3652,6 @@ def restore_main_record() -> Any:
     table_name = record["table_name"]
     record_pk = record["record_pk"]
     version_id = record.get("version_id")
-    restore_previous_version_id = current_record_version_id(table_name, record_pk)
-    restore_record_version_id = restore_previous_version_id + 1
     source_version = "source"
     if table_name == "airfoils":
         source_version = "master"
@@ -3953,25 +3669,6 @@ def restore_main_record() -> Any:
             WHERE delete_id = %s AND is_active = 1
             """,
             (user["user_id"], user["username"], delete_id),
-        )
-        execute_write(
-            """
-            INSERT INTO audit_logs
-                (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
-            VALUES (%s, 'UPDATE', %s, %s, %s,
-                    JSON_OBJECT('logical_delete', TRUE, 'is_active', 1),
-                    JSON_OBJECT('logical_delete', FALSE, 'is_active', 0,
-                                'restored_by_user_id', %s,
-                                'restored_by_username', %s))
-            """,
-            (
-                table_name,
-                record_pk,
-                restore_previous_version_id,
-                restore_record_version_id,
-                user["user_id"],
-                user["username"],
-            ),
         )
         mark_lineage_restored(table_name, record_pk, record.get("airfoil_id"), source_version, user)
     except pymysql.MySQLError as exc:
@@ -4067,353 +3764,6 @@ def delete_saved_transaction() -> Any:
     return jsonify({"ok": bool(affected), "deleted": affected})
 
 
-DB_OBJECT_EXPERIMENT_SQL: dict[str, list[dict[str, str]]] = {
-    "views": [
-        {
-            "title": "视图查询：v_airfoil_overview",
-            "sql": """SELECT *
-FROM v_airfoil_overview
-ORDER BY anomaly_count DESC, airfoil_id
-LIMIT 8;""",
-        },
-        {
-            "title": "视图查询：v_performance_with_ld",
-            "sql": """SELECT airfoil_id, alpha_deg, reynolds_number, cl, cd,
-       ROUND(lift_drag_ratio, 6) AS lift_drag_ratio
-FROM v_performance_with_ld
-WHERE reynolds_number = 50000
-ORDER BY lift_drag_ratio DESC
-LIMIT 8;""",
-        },
-        {
-            "title": "视图查询：v_anomaly_details",
-            "sql": """SELECT anomaly_id, airfoil_id, airfoil_name, rule_type, cl, cd,
-       ROUND(lift_drag_ratio, 6) AS lift_drag_ratio
-FROM v_anomaly_details
-ORDER BY anomaly_id
-LIMIT 8;""",
-        },
-    ],
-    "trigger_reject": [
-        {
-            "title": "准备一条非异常性能记录",
-            "sql": """INSERT INTO performance_records
-    (perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
-VALUES
-    (9200001, 'ag03', 1, 2.34, 654322, 0.100, 0.010, 0.000, 'generated_synthetic', 0)
-ON DUPLICATE KEY UPDATE
-    airfoil_id = VALUES(airfoil_id),
-    version_id = VALUES(version_id),
-    alpha_deg = VALUES(alpha_deg),
-    reynolds_number = VALUES(reynolds_number),
-    cl = VALUES(cl),
-    cd = VALUES(cd),
-    cm = VALUES(cm),
-    is_anomaly = 0;""",
-        },
-        {"title": "清理旧异常记录", "sql": "DELETE FROM anomaly_records WHERE anomaly_id = 9920001;"},
-        {
-            "title": "触发器拒绝测试",
-            "sql": """INSERT INTO anomaly_records
-    (anomaly_id, perf_id, airfoil_id, version_id, rule_type, detail)
-VALUES
-    (9920001, 9200001, 'ag03', 1, 'negative_cd', 'frontend trigger rejection demo');""",
-        },
-        {
-            "title": "验证被引用性能记录",
-            "sql": """SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, is_anomaly
-FROM performance_records
-WHERE perf_id = 9200001;""",
-        },
-    ],
-    "trigger_audit": [
-        {
-            "title": "准备审计测试记录",
-            "sql": """INSERT INTO performance_records
-    (perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
-VALUES
-    (9200001, 'ag03', 1, 2.34, 654322, 0.100, 0.010, 0.000, 'generated_synthetic', 0)
-ON DUPLICATE KEY UPDATE
-    cl = 0.100,
-    cd = 0.010,
-    cm = 0.000,
-    is_anomaly = 0;""",
-        },
-        {"title": "触发 UPDATE 审计", "sql": "UPDATE performance_records SET cl = cl + 0.002 WHERE perf_id = 9200001;"},
-        {
-            "title": "查看当前性能记录",
-            "sql": """SELECT perf_id, cl, cd, cm, is_anomaly
-FROM performance_records
-WHERE perf_id = 9200001;""",
-        },
-        {
-            "title": "查看触发器写入的审计日志",
-            "sql": """SELECT audit_id, table_name, operation_type, record_pk, old_values, new_values, changed_at
-FROM audit_logs
-WHERE table_name = 'performance_records' AND record_pk = '9200001'
-ORDER BY audit_id DESC
-LIMIT 5;""",
-        },
-    ],
-    "proc_summary": [
-        {"title": "调用单翼型性能统计存储过程", "sql": "CALL sp_airfoil_performance_summary('ag03', 1);"},
-        {"title": "调用同一 Re 下多翼型对比存储过程", "sql": "CALL sp_compare_airfoils_by_re(50000, 'max_ld', 10);"},
-    ],
-    "proc_import_bad": [
-        {"title": "清理正式表测试记录", "sql": "DELETE FROM performance_records WHERE perf_id IN (9900101, 9900102);"},
-        {"title": "清理暂存表测试批次", "sql": "DELETE FROM performance_import_staging WHERE batch_id = 'demo_bad_batch';"},
-        {
-            "title": "写入非法批量导入暂存数据",
-            "sql": """INSERT INTO performance_import_staging
-    (batch_id, perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
-VALUES
-    ('demo_bad_batch', 9900101, 'ag03', 1, 0, 123456, 0.5, 0.01, 0.0, 'generated_synthetic', 0),
-    ('demo_bad_batch', 9900102, 'ag03', 1, 99, 123456, 0.6, 0.02, 0.0, 'generated_synthetic', 0);""",
-        },
-        {"title": "调用批量导入存储过程", "sql": "CALL sp_import_performance_batch('demo_bad_batch');"},
-        {
-            "title": "验证正式表没有写入非法批次",
-            "sql": """SELECT perf_id, airfoil_id, alpha_deg, reynolds_number
-FROM performance_records
-WHERE perf_id IN (9900101, 9900102);""",
-        },
-    ],
-    "proc_import_good": [
-        {"title": "清理正式表测试记录", "sql": "DELETE FROM performance_records WHERE perf_id IN (9900201, 9900202);"},
-        {"title": "清理暂存表测试批次", "sql": "DELETE FROM performance_import_staging WHERE batch_id = 'demo_good_batch';"},
-        {
-            "title": "写入合法批量导入暂存数据",
-            "sql": """INSERT INTO performance_import_staging
-    (batch_id, perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd, cm, source_type, is_anomaly)
-VALUES
-    ('demo_good_batch', 9900201, 'ag03', 1, -1, 123457, 0.45, 0.012, 0.0, 'generated_synthetic', 0),
-    ('demo_good_batch', 9900202, 'ag03', 1, 1, 123457, 0.55, 0.013, 0.0, 'generated_synthetic', 0);""",
-        },
-        {"title": "调用批量导入存储过程", "sql": "CALL sp_import_performance_batch('demo_good_batch');"},
-        {
-            "title": "验证正式表已写入合法批次",
-            "sql": """SELECT perf_id, airfoil_id, version_id, alpha_deg, reynolds_number, cl, cd
-FROM performance_records
-WHERE perf_id IN (9900201, 9900202)
-ORDER BY perf_id;""",
-        },
-    ],
-}
-
-
-DB_OBJECT_DEFINITION_SQL: dict[str, list[dict[str, str]]] = {
-    "views": [
-        {
-            "title": "创建视图：v_airfoil_overview（翼型总览）",
-            "sql": """CREATE VIEW v_airfoil_overview AS
-SELECT a.airfoil_id, a.name, a.family, a.source_type,
-       COUNT(DISTINCT dv.version_id) AS version_count,
-       COUNT(DISTINCT cp.point_order) AS coordinate_count,
-       COUNT(DISTINCT pr.perf_id) AS performance_count,
-       COUNT(DISTINCT ar.anomaly_id) AS anomaly_count
-FROM airfoils a
-LEFT JOIN data_versions dv ON dv.airfoil_id = a.airfoil_id
-LEFT JOIN coordinate_points cp ON cp.airfoil_id = dv.airfoil_id AND cp.version_id = dv.version_id
-LEFT JOIN performance_records pr ON pr.airfoil_id = dv.airfoil_id AND pr.version_id = dv.version_id
-LEFT JOIN anomaly_records ar ON ar.perf_id = pr.perf_id
-GROUP BY a.airfoil_id, a.name, a.family, a.source_type;""",
-        },
-        {
-            "title": "创建视图：v_performance_with_ld（性能记录派生升阻比）",
-            "sql": """CREATE VIEW v_performance_with_ld AS
-SELECT p.perf_id, p.airfoil_id, a.name AS airfoil_name, p.version_id,
-       p.alpha_deg, p.reynolds_number, p.cl, p.cd, p.cm,
-       CASE WHEN p.cd = 0 THEN NULL ELSE p.cl / p.cd END AS lift_drag_ratio,
-       p.is_anomaly
-FROM performance_records p
-JOIN airfoils a ON a.airfoil_id = p.airfoil_id;""",
-        },
-        {
-            "title": "创建视图：v_anomaly_details（异常详情关联查询）",
-            "sql": """CREATE VIEW v_anomaly_details AS
-SELECT ar.anomaly_id, ar.rule_type, ar.detail,
-       p.perf_id, p.airfoil_id, a.name AS airfoil_name,
-       p.version_id, p.alpha_deg, p.reynolds_number, p.cl, p.cd, p.cm,
-       CASE WHEN p.cd = 0 THEN NULL ELSE p.cl / p.cd END AS lift_drag_ratio
-FROM anomaly_records ar
-JOIN performance_records p ON p.perf_id = ar.perf_id
-JOIN airfoils a ON a.airfoil_id = p.airfoil_id;""",
-        },
-    ],
-    "trigger_reject": [
-        {
-            "title": "创建触发器：trg_anomaly_requires_flag_insert（异常记录必须引用异常性能记录）",
-            "sql": """CREATE TRIGGER trg_anomaly_requires_flag_insert
-BEFORE INSERT ON anomaly_records
-FOR EACH ROW
-BEGIN
-    IF (SELECT is_anomaly FROM performance_records WHERE perf_id = NEW.perf_id) <> 1 THEN
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'AnomalyRecord must reference a PerformanceRecord with is_anomaly = 1';
-    END IF;
-END;""",
-        },
-    ],
-    "trigger_audit": [
-        {
-            "title": "创建触发器：trg_audit_performance_update（性能记录更新审计）",
-            "sql": """CREATE TRIGGER trg_audit_performance_update
-AFTER UPDATE ON performance_records
-FOR EACH ROW
-FOLLOWS trg_lineage_performance_update
-BEGIN
-    INSERT INTO audit_logs
-        (table_name, operation_type, record_pk, previous_record_version_id, record_version_id, old_values, new_values)
-    VALUES
-        ('performance_records', 'UPDATE', CAST(OLD.perf_id AS CHAR),
-         COALESCE((SELECT previous_record_version_id FROM data_record_lineage
-                   WHERE table_name = 'performance_records' AND record_pk = CAST(OLD.perf_id AS CHAR) LIMIT 1), 0),
-         COALESCE((SELECT record_version_id FROM data_record_lineage
-                   WHERE table_name = 'performance_records' AND record_pk = CAST(OLD.perf_id AS CHAR) LIMIT 1), 1),
-         JSON_OBJECT('cl', OLD.cl, 'cd', OLD.cd, 'cm', OLD.cm, 'is_anomaly', OLD.is_anomaly),
-         JSON_OBJECT('cl', NEW.cl, 'cd', NEW.cd, 'cm', NEW.cm, 'is_anomaly', NEW.is_anomaly));
-END;""",
-        },
-    ],
-    "proc_summary": [
-        {
-            "title": "创建存储过程：sp_airfoil_performance_summary（单翼型性能统计）",
-            "sql": """CREATE PROCEDURE sp_airfoil_performance_summary(IN p_airfoil_id VARCHAR(64), IN p_version_id INT)
-BEGIN
-    SELECT p.airfoil_id, a.name AS airfoil_name, p.version_id, p.reynolds_number,
-           COUNT(*) AS sample_count,
-           ROUND(MIN(p.cd), 6) AS min_cd,
-           ROUND(MAX(p.cl), 6) AS max_cl,
-           ROUND(AVG(p.cl), 6) AS avg_cl,
-           ROUND(MAX(p.cl / NULLIF(p.cd, 0)), 6) AS max_lift_drag_ratio,
-           SUM(p.is_anomaly) AS anomaly_count
-    FROM performance_records p
-    JOIN airfoils a ON a.airfoil_id = p.airfoil_id
-    WHERE p.airfoil_id = p_airfoil_id AND p.version_id = p_version_id
-    GROUP BY p.airfoil_id, a.name, p.version_id, p.reynolds_number
-    ORDER BY p.reynolds_number;
-END;""",
-        },
-        {
-            "title": "创建存储过程：sp_compare_airfoils_by_re（同一 Re 多翼型对比）",
-            "sql": """CREATE PROCEDURE sp_compare_airfoils_by_re(IN p_reynolds_number INT, IN p_metric VARCHAR(32), IN p_limit_count INT)
-BEGIN
-    SELECT ranked.airfoil_id, ranked.airfoil_name, ranked.metric_name, ranked.metric_value
-    FROM (
-        SELECT p.airfoil_id, a.name AS airfoil_name,
-               CASE ... END AS metric_name,
-               CASE ... END AS metric_value
-        FROM performance_records p
-        JOIN airfoils a ON a.airfoil_id = p.airfoil_id
-        WHERE p.reynolds_number = p_reynolds_number
-        GROUP BY p.airfoil_id, a.name
-    ) ranked
-    ORDER BY metric_value DESC
-    LIMIT p_limit_count;
-END;""",
-        },
-    ],
-    "proc_import_bad": [
-        {
-            "title": "创建存储过程：sp_validate_performance_import_batch（导入前校验）",
-            "sql": """CREATE PROCEDURE sp_validate_performance_import_batch(IN p_batch_id VARCHAR(64))
-BEGIN
-    UPDATE performance_import_staging
-    SET validation_error = CONCAT_WS('; ',
-        CASE WHEN alpha_deg < -20 OR alpha_deg > 25 THEN 'alpha_deg out of range [-20, 25]' END,
-        CASE WHEN reynolds_number <= 0 THEN 'reynolds_number must be positive' END,
-        CASE WHEN referenced data version does not exist THEN 'referenced data version does not exist' END,
-        CASE WHEN perf_id already exists THEN 'perf_id already exists' END
-    )
-    WHERE batch_id = p_batch_id AND imported = 0;
-    SELECT * FROM performance_import_staging WHERE batch_id = p_batch_id;
-END;""",
-        },
-        {
-            "title": "创建存储过程：sp_import_performance_batch（非法批次整体回滚）",
-            "sql": """CREATE PROCEDURE sp_import_performance_batch(IN p_batch_id VARCHAR(64))
-BEGIN
-    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
-    START TRANSACTION;
-    CALL sp_validate_performance_import_batch(p_batch_id);
-    IF EXISTS(SELECT 1 FROM performance_import_staging WHERE batch_id = p_batch_id AND validation_error IS NOT NULL) THEN
-        ROLLBACK;
-        SELECT 'rejected' AS status;
-    ELSE
-        INSERT INTO performance_records (...) SELECT ... FROM performance_import_staging WHERE batch_id = p_batch_id;
-        COMMIT;
-    END IF;
-END;""",
-        },
-    ],
-    "proc_import_good": [
-        {
-            "title": "创建存储过程：sp_import_performance_batch（合法批次整体提交）",
-            "sql": """CREATE PROCEDURE sp_import_performance_batch(IN p_batch_id VARCHAR(64))
-BEGIN
-    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
-    START TRANSACTION;
-    CALL sp_validate_performance_import_batch(p_batch_id);
-    INSERT INTO performance_records (...)
-    SELECT ... FROM performance_import_staging
-    WHERE batch_id = p_batch_id AND validation_error IS NULL;
-    UPDATE performance_import_staging SET imported = 1 WHERE batch_id = p_batch_id;
-    COMMIT;
-END;""",
-        },
-    ],
-}
-DB_OBJECT_DEFINITION_OBJECTS: dict[str, list[tuple[str, str, str]]] = {
-    "views": [
-        ("VIEW", "v_airfoil_overview", "视图：翼型总览"),
-        ("VIEW", "v_performance_with_ld", "视图：性能记录派生升阻比"),
-        ("VIEW", "v_anomaly_details", "视图：异常详情关联查询"),
-    ],
-    "trigger_reject": [
-        ("TRIGGER", "trg_anomaly_requires_flag_insert", "触发器：异常记录必须引用异常性能记录"),
-        ("TRIGGER", "trg_anomaly_requires_flag_update", "触发器：异常记录更新时重新校验"),
-    ],
-    "trigger_audit": [
-        ("TRIGGER", "trg_audit_performance_update", "触发器：性能记录更新审计"),
-    ],
-    "proc_summary": [
-        ("PROCEDURE", "sp_airfoil_performance_summary", "存储过程：单翼型性能统计"),
-        ("PROCEDURE", "sp_compare_airfoils_by_re", "存储过程：同一 Re 多翼型对比"),
-    ],
-    "proc_import_bad": [
-        ("PROCEDURE", "sp_validate_performance_import_batch", "存储过程：批量导入校验"),
-        ("PROCEDURE", "sp_import_performance_batch", "存储过程：批量导入提交或回滚"),
-    ],
-    "proc_import_good": [
-        ("PROCEDURE", "sp_validate_performance_import_batch", "存储过程：批量导入校验"),
-        ("PROCEDURE", "sp_import_performance_batch", "存储过程：批量导入提交或回滚"),
-    ],
-}
-
-
-def quote_identifier(identifier: str) -> str:
-    return "`" + identifier.replace("`", "``") + "`"
-
-
-def db_object_definition_blocks(scenario: str) -> list[dict[str, str]]:
-    blocks: list[dict[str, str]] = []
-    for object_type, object_name, title in DB_OBJECT_DEFINITION_OBJECTS.get(scenario, []):
-        try:
-            rows = query_all(f"SHOW CREATE {object_type} {quote_identifier(object_name)}")
-            if not rows:
-                continue
-            row = rows[0]
-            create_sql = ""
-            for key, value in row.items():
-                normalized = str(key).lower()
-                if normalized.startswith("create ") or normalized == "sql original statement":
-                    create_sql = str(value)
-                    break
-            if create_sql:
-                blocks.append({"title": title, "sql": create_sql})
-        except pymysql.MySQLError:
-            continue
-    return blocks or DB_OBJECT_DEFINITION_SQL.get(scenario, [])
 @app.post("/api/db_object_experiment/run")
 def run_db_object_experiment() -> Any:
     user = current_user()
@@ -4442,7 +3792,7 @@ def run_db_object_experiment() -> Any:
                 },
                 {
                     "title": "v_performance_with_ld",
-                    "note": "Derived lift_drag_ratio（升阻比）= CL（升力系数） / CD（阻力系数） is exposed by the view.",
+                    "note": "Derived lift_drag_ratio = cl / cd is exposed by the view.",
                     "rows": query_all(
                         """
                         SELECT airfoil_id, alpha_deg, reynolds_number, cl, cd, ROUND(lift_drag_ratio, 6) AS lift_drag_ratio
@@ -4640,15 +3990,7 @@ def run_db_object_experiment() -> Any:
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     log_user_action(user["user_id"], f"Ran DB object experiment {scenario}", sql_log, 1, elapsed_ms)
-    return jsonify(
-        {
-            "scenario": scenario,
-            "elapsed_ms": elapsed_ms,
-            "definition_blocks": db_object_definition_blocks(scenario),
-            "sql_blocks": DB_OBJECT_EXPERIMENT_SQL.get(scenario, []),
-            "sections": sections,
-        }
-    )
+    return jsonify({"scenario": scenario, "elapsed_ms": elapsed_ms, "sections": sections})
 
 
 def performance_index_exists() -> bool:
@@ -4923,185 +4265,6 @@ def run_transaction_experiment() -> Any:
     )
 
 
-@app.post("/api/transaction_experiment/run_queue")
-def run_transaction_queue() -> Any:
-    user = current_user()
-    if not user or not is_manager(user["role"]):
-        return jsonify({"error": "engineer/admin permission required"}), 403
-
-    payload = request.get_json(silent=True) or {}
-    mode = str(payload.get("mode", "rollback")).strip().lower()
-    if mode not in {"commit", "rollback"}:
-        return jsonify({"error": "mode must be commit or rollback"}), 400
-
-    saved_ids_raw = payload.get("saved_ids", [])
-    if not isinstance(saved_ids_raw, list):
-        return jsonify({"error": "saved_ids must be an ordered list"}), 400
-    try:
-        saved_ids = [int(x) for x in saved_ids_raw if int(x or 0) > 0]
-    except (TypeError, ValueError):
-        return jsonify({"error": "saved_ids must contain numeric ids"}), 400
-    if not saved_ids:
-        return jsonify({"error": "transaction queue is empty"}), 400
-    if len(saved_ids) > 10:
-        return jsonify({"error": "at most 10 saved transactions per queue run"}), 400
-
-    placeholders = ",".join(["%s"] * len(saved_ids))
-    saved_rows = query_all(
-        f"""
-        SELECT saved_id, title, sql_text
-        FROM saved_transactions
-        WHERE user_id = %s AND saved_id IN ({placeholders})
-        """,
-        tuple([user["user_id"], *saved_ids]),
-    )
-    saved_by_id = {int(row["saved_id"]): row for row in saved_rows}
-    missing = [saved_id for saved_id in saved_ids if saved_id not in saved_by_id]
-    if missing:
-        return jsonify({"error": f"saved transaction not found or not yours: {missing}"}), 404
-
-    ordered_transactions = [saved_by_id[saved_id] for saved_id in saved_ids]
-    timeline: list[dict[str, Any]] = []
-    transaction_results: list[dict[str, Any]] = []
-    start = time.perf_counter()
-
-    def add_event(queue_index: int, title: str, event: str, status: str = "ok", elapsed_ms: float | None = None, detail: str = "") -> None:
-        timeline.append(
-            {
-                "at_ms": round((time.perf_counter() - start) * 1000, 3),
-                "queue_step": queue_index,
-                "transaction": title,
-                "event": event,
-                "status": status,
-                "elapsed_ms": None if elapsed_ms is None else round(elapsed_ms, 3),
-                "detail": detail,
-            }
-        )
-
-    final_status = "rolled back" if mode == "rollback" else "committed"
-    for queue_index, item in enumerate(ordered_transactions, start=1):
-        title = str(item["title"])
-        sql_text = str(item["sql_text"])
-        statements = split_sql_statements(sql_text)
-        if not statements:
-            return jsonify({"error": f"{title}: transaction SQL is empty"}), 400
-        if len(statements) > 20:
-            return jsonify({"error": f"{title}: at most 20 statements per transaction"}), 400
-        if any(not is_allowed_transaction_sql(statement) for statement in statements):
-            log_user_action(user["user_id"], "Rejected transaction queue", sql_text, 0)
-            return jsonify({"error": f"{title}: only SELECT/INSERT/UPDATE/DELETE are allowed"}), 400
-
-        conn = pymysql.connect(**db_config(), autocommit=False)
-        results: list[dict[str, Any]] = []
-        tx_start = time.perf_counter()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("START TRANSACTION")
-                add_event(queue_index, title, "BEGIN")
-                for stmt_index, statement in enumerate(statements, start=1):
-                    statement_start = time.perf_counter()
-                    affected = cur.execute(statement)
-                    elapsed_ms = (time.perf_counter() - statement_start) * 1000
-                    statement_type = statement.split(None, 1)[0].upper()
-                    if statement.lstrip().lower().startswith("select "):
-                        rows = list(cur.fetchall())
-                        results.append(
-                            {
-                                "queue_step": queue_index,
-                                "step": stmt_index,
-                                "type": "SELECT",
-                                "sql": statement,
-                                "row_count": len(rows),
-                                "affected_rows": None,
-                                "elapsed_ms": round(elapsed_ms, 3),
-                                "rows": rows[:50],
-                            }
-                        )
-                        add_event(queue_index, title, f"SQL {stmt_index}: SELECT", "ok", elapsed_ms, f"rows={len(rows)}")
-                    else:
-                        results.append(
-                            {
-                                "queue_step": queue_index,
-                                "step": stmt_index,
-                                "type": statement_type,
-                                "sql": statement,
-                                "row_count": 0,
-                                "affected_rows": int(affected),
-                                "elapsed_ms": round(elapsed_ms, 3),
-                                "rows": [],
-                            }
-                        )
-                        add_event(queue_index, title, f"SQL {stmt_index}: {statement_type}", "ok", elapsed_ms, f"affected={int(affected)}")
-
-            if mode == "commit":
-                commit_start = time.perf_counter()
-                conn.commit()
-                add_event(queue_index, title, "COMMIT", "ok", (time.perf_counter() - commit_start) * 1000)
-                tx_status = "committed"
-            else:
-                rollback_start = time.perf_counter()
-                conn.rollback()
-                add_event(queue_index, title, "ROLLBACK", "ok", (time.perf_counter() - rollback_start) * 1000)
-                tx_status = "rolled back"
-            transaction_results.append(
-                {
-                    "queue_step": queue_index,
-                    "saved_id": int(item["saved_id"]),
-                    "title": title,
-                    "status": tx_status,
-                    "statement_count": len(statements),
-                    "elapsed_ms": round((time.perf_counter() - tx_start) * 1000, 3),
-                    "results": results,
-                }
-            )
-        except pymysql.MySQLError as exc:
-            conn.rollback()
-            add_event(queue_index, title, "ROLLBACK after error", "failed", detail=str(exc))
-            transaction_results.append(
-                {
-                    "queue_step": queue_index,
-                    "saved_id": int(item["saved_id"]),
-                    "title": title,
-                    "status": "rolled back",
-                    "statement_count": len(statements),
-                    "elapsed_ms": round((time.perf_counter() - tx_start) * 1000, 3),
-                    "results": results,
-                    "error": str(exc),
-                }
-            )
-            final_status = "failed"
-            elapsed_total = (time.perf_counter() - start) * 1000
-            log_user_action(user["user_id"], "Failed transaction queue", " -> ".join(row["title"] for row in ordered_transactions), 0, int(elapsed_total))
-            conn.close()
-            return jsonify(
-                {
-                    "status": final_status,
-                    "mode": mode,
-                    "elapsed_ms": round(elapsed_total, 3),
-                    "queue_count": len(saved_ids),
-                    "timeline": timeline,
-                    "transactions": transaction_results,
-                    "error": str(exc),
-                }
-            ), 400
-        finally:
-            if conn.open:
-                conn.close()
-
-    elapsed_total = (time.perf_counter() - start) * 1000
-    log_user_action(user["user_id"], f"Transaction queue {final_status}", " -> ".join(row["title"] for row in ordered_transactions), 1, int(elapsed_total))
-    return jsonify(
-        {
-            "status": final_status,
-            "mode": mode,
-            "elapsed_ms": round(elapsed_total, 3),
-            "queue_count": len(saved_ids),
-            "timeline": timeline,
-            "transactions": transaction_results,
-        }
-    )
-
-
 @app.post("/api/transaction_experiment/concurrency")
 def run_concurrency_experiment() -> Any:
     user = current_user()
@@ -5222,313 +4385,76 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Airfoil Database</title>
   <style>
-    :root {
-      --bg:#edf1ee;
-      --shell:#191d1b;
-      --shell-2:#232823;
-      --panel:#ffffff;
-      --panel-soft:#f7f8f4;
-      --panel-warm:#fffaf0;
-      --line:#d8ded7;
-      --line-strong:#aeb9ae;
-      --ink:#20251f;
-      --muted:#657066;
-      --accent:#16746b;
-      --accent-2:#b46f19;
-      --danger:#b42318;
-      --ok:#2f7a39;
-      --shadow:0 18px 44px rgba(33,38,31,.14);
-      --mono:Consolas,"SFMono-Regular","Liberation Mono",monospace;
-      --ui:"Segoe UI",Arial,"Microsoft YaHei",sans-serif;
-    }
+    :root { --bg:#f7f8fb; --panel:#fff; --line:#d8dde8; --ink:#172033; --muted:#62708a; --accent:#1f766f; --danger:#b42318; }
     * { box-sizing:border-box; }
-    html,body { height:100%; }
-    body {
-      margin:0;
-      font-family:var(--ui);
-      font-size:14px;
-      color:var(--ink);
-      background:
-        linear-gradient(135deg,rgba(22,116,107,.10),transparent 34%),
-        linear-gradient(315deg,rgba(180,111,25,.11),transparent 30%),
-        var(--bg);
-      letter-spacing:0;
-    }
-    body::before {
-      content:"";
-      position:fixed;
-      inset:0;
-      pointer-events:none;
-      background-image:
-        linear-gradient(rgba(32,37,31,.045) 1px,transparent 1px),
-        linear-gradient(90deg,rgba(32,37,31,.04) 1px,transparent 1px);
-      background-size:36px 36px;
-      mask-image:linear-gradient(180deg,rgba(0,0,0,.72),rgba(0,0,0,.08));
-    }
-    h1,h2 { margin:0; letter-spacing:0; }
-    h1 { font-size:24px; line-height:1.15; font-weight:760; }
-    h2 { margin:0 0 10px; font-size:15px; line-height:1.25; font-weight:720; }
-    .sub,.status { color:var(--muted); font-size:13px; line-height:1.45; overflow-wrap:anywhere; }
-    #airfoilMeta { display:block; line-height:1.55; }
-    #airfoilMeta b { color:#3a4338; font-weight:700; }
-    .authGate {
-      position:fixed;
-      inset:0;
-      z-index:1000;
-      min-height:100vh;
-      display:grid;
-      place-items:center;
-      padding:24px;
-      overflow:auto;
-      background:
-        linear-gradient(135deg,#181d1a 0%,#2f3328 48%,#efe9dc 100%);
-    }
-    .authCard {
-      width:min(500px,100%);
-      background:rgba(255,255,255,.92);
-      border:1px solid rgba(255,255,255,.72);
-      border-radius:8px;
-      padding:26px;
-      box-shadow:0 28px 70px rgba(0,0,0,.28);
-      display:grid;
-      gap:14px;
-      backdrop-filter:blur(14px);
-    }
-    .authCard h1 { font-size:28px; }
-    .authActions { display:flex; gap:10px; flex-wrap:wrap; }
-    .app {
-      height:100vh;
-      min-height:0;
-      display:none;
-      grid-template-columns:330px minmax(0,1fr);
-      overflow:hidden;
-      position:relative;
-    }
+    body { margin:0; font-family:"Segoe UI",Arial,"Microsoft YaHei",sans-serif; font-size:14px; color:var(--ink); background:var(--bg); }
+    .authGate { position:fixed; inset:0; z-index:1000; min-height:100vh; display:grid; place-items:start center; padding:24px; overflow:auto; background:linear-gradient(180deg,#f7f8fb,#eef3f5); }
+    .authCard { width:min(460px,100%); background:#fff; border:1px solid var(--line); border-radius:10px; padding:22px; box-shadow:0 16px 36px rgba(26,34,55,.12); display:grid; gap:12px; }
+    .authCard h1 { font-size:24px; }
+    .authActions { display:flex; gap:8px; flex-wrap:wrap; }
+    .app { height:100vh; min-height:0; display:none; grid-template-columns:300px minmax(0,1fr); overflow:hidden; }
     .app.visible { display:grid; }
     .app.noAside { grid-template-columns:minmax(0,1fr); }
     .app.noAside aside { display:none; }
-    aside {
-      height:100vh;
-      min-height:0;
-      padding:20px;
-      display:grid;
-      grid-template-rows:auto auto minmax(0,1fr);
-      gap:14px;
-      overflow:hidden;
-      color:#f5f6ef;
-      background:
-        linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02)),
-        var(--shell);
-      border-right:1px solid rgba(255,255,255,.10);
-      box-shadow:18px 0 42px rgba(23,27,23,.18);
-    }
-    aside h1 { color:#fffaf0; }
-    aside .sub, aside .status { color:#c1cabb; }
-    main {
-      height:100vh;
-      min-width:0;
-      min-height:0;
-      padding:0 20px 28px;
-      display:block;
-      overflow-y:auto;
-      overflow-x:hidden;
-      scroll-behavior:smooth;
-    }
-    input,select,textarea {
-      border:1px solid var(--line);
-      border-radius:6px;
-      background:#fff;
-      color:var(--ink);
-      padding:9px 11px;
-      outline:none;
-      min-width:0;
-      font-size:14px;
-      font-family:var(--ui);
-      transition:border-color .16s ease, box-shadow .16s ease, background .16s ease;
-    }
-    input:focus,select:focus,textarea:focus {
-      border-color:var(--accent);
-      box-shadow:0 0 0 3px rgba(22,116,107,.14);
-    }
-    textarea {
-      min-height:78px;
-      resize:vertical;
-      font-family:var(--mono);
-      font-size:13px;
-      line-height:1.5;
-    }
-    button.action,.tabBtn {
-      min-height:36px;
-      border:1px solid var(--line);
-      border-radius:6px;
-      background:#fff;
-      color:var(--ink);
-      padding:0 12px;
-      cursor:pointer;
-      font-size:14px;
-      font-family:var(--ui);
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      gap:6px;
-      transition:transform .14s ease, border-color .14s ease, background .14s ease, color .14s ease, box-shadow .14s ease;
-    }
-    button.action:hover,.tabBtn:hover { transform:translateY(-1px); border-color:var(--line-strong); box-shadow:0 8px 18px rgba(33,38,31,.10); }
-    button.primary,.tabBtn.active { background:var(--accent); border-color:var(--accent); color:#fff; box-shadow:0 10px 24px rgba(22,116,107,.22); }
-    .search {
-      width:100%;
-      height:40px;
-      color:#f5f6ef;
-      background:rgba(255,255,255,.08);
-      border-color:rgba(255,255,255,.18);
-    }
-    .search::placeholder { color:#aeb9ae; }
-    .search:focus { background:rgba(255,255,255,.12); border-color:#7bc6bc; box-shadow:0 0 0 3px rgba(123,198,188,.18); }
-    .list {
-      min-height:0;
-      overflow-y:auto;
-      overflow-x:hidden;
-      border:1px solid rgba(255,255,255,.14);
-      background:rgba(255,255,255,.06);
-      border-radius:8px;
-    }
-    .item {
-      width:100%;
-      min-height:62px;
-      display:grid;
-      grid-template-columns:minmax(0,1fr) auto;
-      gap:10px;
-      border:0;
-      border-bottom:1px solid rgba(255,255,255,.10);
-      background:transparent;
-      padding:12px;
-      text-align:left;
-      cursor:pointer;
-      color:#f7f7f0;
-    }
-    .item:hover,.item.active { background:rgba(22,116,107,.22); }
-    .item.active { box-shadow:inset 3px 0 0 #7bc6bc; }
+    aside { height:100vh; min-height:0; border-right:1px solid var(--line); background:#fcfdff; padding:18px; display:grid; grid-template-rows:auto auto minmax(0,1fr); gap:14px; overflow:hidden; }
+    main { height:100vh; min-width:0; min-height:0; padding:18px; display:block; overflow-y:auto; overflow-x:hidden; }
+    h1 { margin:0; font-size:23px; } h2 { margin:0 0 10px; font-size:17px; }
+    .sub,.status { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+    input,select,textarea { border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); padding:9px 11px; outline:none; min-width:0; font-size:14px; }
+    textarea { min-height:78px; resize:vertical; font-family:Consolas,monospace; font-size:13px; line-height:1.45; }
+    button.action { min-height:36px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); padding:0 12px; cursor:pointer; font-size:14px; }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .search { width:100%; height:36px; }
+    .list { min-height:0; overflow-y:auto; overflow-x:hidden; border:1px solid var(--line); background:var(--panel); border-radius:8px; }
+    .item { width:100%; min-height:54px; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; border:0; border-bottom:1px solid var(--line); background:transparent; padding:10px 12px; text-align:left; cursor:pointer; color:var(--ink); }
+    .item:hover,.item.active { background:#eef7f6; }
     .item strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; }
-    .item span { color:#c1cabb; font-size:12px; }
-    .badge { align-self:start; border-radius:999px; background:#fffaf0; padding:3px 8px; font-size:12px; color:#473312; font-weight:700; }
-    .pageTabs {
-      position:sticky;
-      top:0;
-      z-index:100;
-      display:flex;
-      flex-wrap:wrap;
-      gap:8px;
-      align-items:center;
-      margin:0 -20px 16px;
-      padding:14px 20px;
-      background:#edf1ee;
-      border-bottom:1px solid rgba(174,185,174,.72);
-      box-shadow:0 8px 18px rgba(33,38,31,.08);
-      overflow:hidden;
-      isolation:isolate;
-    }
-    .pageTabs::before {
-      content:"";
-      position:absolute;
-      inset:0;
-      z-index:-1;
-      background:#edf1ee;
-    }
+    .item span { color:var(--muted); font-size:13px; }
+    .badge { align-self:start; border-radius:999px; background:#edf0f6; padding:3px 8px; font-size:12px; color:var(--muted); }
+    .panel,.titlebar,.versionBox,section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; box-shadow:0 8px 22px rgba(26,34,55,.08); }
+    .panel { display:grid; gap:10px; }
+    .pageTabs { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:14px; }
     .pageTabs .userMenu { margin-left:auto; }
-    .tabBtn { min-height:38px; padding:0 14px; line-height:1; }
+    .tabBtn { min-height:38px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); padding:0 14px; cursor:pointer; font-size:14px; line-height:1; display:inline-flex; align-items:center; justify-content:center; }
+    .tabBtn.active { background:var(--accent); border-color:var(--accent); color:#fff; }
     .page { min-height:0; display:none; gap:14px; align-content:start; }
     .page.active { display:grid; }
     .splitPage { grid-template-columns:minmax(360px,.9fr) minmax(460px,1.1fr); align-items:start; }
     #pageIndex.splitPage { grid-template-columns:1fr; }
-    .panel,.titlebar,.versionBox,section,.page > .experiment {
-      background:rgba(255,255,255,.90);
-      border:1px solid rgba(216,222,215,.95);
-      border-radius:8px;
-      padding:14px;
-      box-shadow:var(--shadow);
-      backdrop-filter:blur(10px);
-    }
-    .panel { display:grid; gap:12px; }
-    .toolbar { display:flex; gap:10px; align-items:center; justify-content:space-between; margin-bottom:10px; min-width:0; }
-    .toolbar h2 { margin:0; flex:0 0 auto; }
-    .chartSection .toolbar .status { text-align:right; max-width:72%; }
+    .toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; margin-bottom:10px; }
     .userMenu { display:none; align-items:center; justify-content:flex-end; gap:10px; min-width:0; }
     .userMenu .status { white-space:nowrap; }
-    .top { display:grid; grid-template-columns:minmax(0,1fr) minmax(260px,340px); gap:14px; align-items:stretch; }
-    .titlebar {
-      min-height:92px;
-      display:flex;
-      flex-direction:column;
-      justify-content:center;
-      background:
-        linear-gradient(135deg,rgba(22,116,107,.14),rgba(255,250,240,.90) 42%,rgba(180,111,25,.12)),
-        #fff;
-    }
-    .versionBox { display:grid; grid-template-columns:auto minmax(190px,1fr); gap:10px; align-items:center; min-height:92px; }
+    .top { display:grid; grid-template-columns:minmax(0,1fr) minmax(260px,320px); gap:12px; align-items:stretch; }
+    .titlebar { display:flex; flex-direction:column; justify-content:center; min-height:78px; }
+    .versionBox { display:grid; grid-template-columns:auto minmax(190px,1fr); gap:10px; align-items:center; min-height:78px; }
     .versionBox h2 { margin:0; }
     .versionBox select { width:100%; }
     .formRow { display:grid; grid-template-columns:160px 160px auto; gap:8px; align-items:center; }
     .sqlRow { display:grid; grid-template-columns:minmax(220px,260px) minmax(0,1fr) auto; gap:10px; align-items:start; }
-    .adminPanel,.editorPanel,.transactionPanel,.dbObjectPanel,.batchPanel,.governancePanel { display:none; border-top:1px solid var(--line); padding-top:12px; gap:10px; }
+    .adminPanel,.editorPanel,.transactionPanel,.dbObjectPanel,.batchPanel,.governancePanel { display:none; border-top:1px solid var(--line); padding-top:10px; gap:8px; }
     .adminPanel.visible,.editorPanel.visible,.transactionPanel.visible,.dbObjectPanel.visible,.batchPanel.visible,.governancePanel.visible { display:grid; }
     .createRow { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)) auto; gap:8px; align-items:center; }
     .grid { min-height:0; display:grid; grid-template-columns:repeat(2,minmax(360px,1fr)); grid-auto-rows:auto; gap:14px; }
     section { min-height:0; overflow:hidden; display:grid; grid-template-rows:auto minmax(0,1fr); }
-    .chartSection { position:relative; height:320px; }
-    .wideChartSection { grid-column:1 / -1; height:390px; }
-    .compareScroll,.versionDiffScroll { min-height:0; height:100%; overflow-y:auto; overflow-x:hidden; border:1px solid var(--line); border-radius:6px; background:#fffdfa; }
-    .compareScroll canvas,.versionDiffScroll canvas { display:block; border:0; border-radius:0; }
+    .chartSection { position:relative; height:300px; }
+    .chartTooltip { position:absolute; display:none; pointer-events:none; z-index:5; max-width:260px; border:1px solid var(--line); border-radius:6px; background:#fff; box-shadow:0 10px 24px rgba(26,34,55,.16); padding:8px 10px; font-family:Consolas,monospace; font-size:13px; line-height:1.45; color:var(--ink); }
     .versionInfoSection { grid-column:1 / -1; }
     .anomalySection { grid-column:1 / -1; min-height:260px; }
-    .shapeSection { grid-column:1 / -1; height:360px; grid-template-rows:auto auto minmax(0,1fr); }
-    .shapeLegend { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; margin:2px 0 10px; padding:8px 10px; border:1px solid rgba(29,79,72,.12); border-radius:6px; background:rgba(255,253,250,.82); color:#435046; font-size:13px; }
-    .legendItem { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; font-weight:700; }
-    .legendMark { width:22px; height:0; border-top:3px solid currentColor; display:inline-block; }
-    .legendDiamond { width:9px; height:9px; display:inline-block; background:currentColor; transform:rotate(45deg); }
-    .legendRing { width:10px; height:10px; display:inline-block; border:2px solid currentColor; border-radius:50%; background:transparent; }
-    canvas { width:100%; height:100%; border:1px solid var(--line); border-radius:6px; background:#fffdfa; }
-    .chartTooltip {
-      position:absolute;
-      display:none;
-      pointer-events:none;
-      z-index:5;
-      max-width:220px;
-      border:1px solid var(--line);
-      border-radius:6px;
-      background:rgba(255,255,255,.96);
-      box-shadow:0 14px 30px rgba(33,38,31,.18);
-      padding:7px 9px;
-      font-family:var(--mono);
-      font-size:12px;
-      line-height:1.38;
-      color:var(--ink);
-    }
-    #shapeTooltip { max-width:190px; }
-    .metrics { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); grid-auto-rows:78px; gap:8px; align-content:start; }
-    .metric {
-      border:1px solid var(--line);
-      border-radius:6px;
-      padding:10px;
-      background:linear-gradient(180deg,#fff,#f8faf5);
-      display:flex;
-      flex-direction:column;
-      justify-content:center;
-    }
-    .metric b { font-size:21px; line-height:1.1; color:#173c37; }
+    .wideChartSection { grid-column:1 / -1; height:380px; }
+    canvas { width:100%; height:100%; border:1px solid var(--line); border-radius:6px; background:#fff; }
+    .metrics { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); grid-auto-rows:72px; gap:8px; align-content:start; }
+    .metric { border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:#fbfcff; display:flex; flex-direction:column; justify-content:center; }
+    .metric b { font-size:20px; }
     .metric span { color:var(--muted); font-size:13px; }
     .versionContent { min-height:0; overflow:auto; display:grid; align-content:start; gap:12px; }
     .experiment { border-top:1px solid var(--line); padding-top:12px; display:grid; gap:10px; }
-    #pageDbObjects,
-    #pageDbObjects .experiment {
-      min-width:0;
-      max-width:100%;
-    }
+    .page > .experiment { border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:14px; box-shadow:0 8px 22px rgba(26,34,55,.08); }
     .indexSqlPanel { min-height:0; display:grid; grid-template-rows:auto auto auto minmax(0,1fr); gap:10px; }
     .experimentControls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
     .iconAction { min-width:42px; font-size:22px; font-weight:700; line-height:1; }
     .iconAction.dangerIcon { color:var(--danger); }
     .rowDeleteBtn { min-width:30px; min-height:28px; padding:0 8px; color:var(--danger); font-weight:700; }
-    .indexForm { display:none; gap:8px; border:1px solid var(--line); border-radius:6px; background:var(--panel-soft); padding:10px; }
+    .indexForm { display:none; gap:8px; border:1px solid var(--line); border-radius:6px; background:#fbfcff; padding:10px; }
     .indexForm.visible { display:grid; }
     .compactIndexForm.visible { grid-template-columns:minmax(220px,320px) minmax(0,1fr) auto; align-items:start; }
     .compactIndexForm .status { grid-column:1 / -1; margin:0; }
@@ -5538,40 +4464,8 @@ INDEX_HTML = r"""
     .keyFilterBox { max-height:none; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
     .keyFilter { display:grid; gap:5px; align-content:start; }
     .keyFilter span { font-size:13px; color:var(--muted); }
-    .glossaryStrip {
-      grid-column:1 / -1;
-      display:flex;
-      flex-wrap:wrap;
-      gap:8px;
-      align-items:center;
-      padding:10px 12px;
-      border:1px solid rgba(22,116,107,.16);
-      border-radius:8px;
-      background:
-        linear-gradient(135deg,rgba(22,116,107,.10),rgba(255,255,255,.88) 42%,rgba(180,111,25,.10)),
-        rgba(255,255,255,.88);
-      box-shadow:0 14px 30px rgba(33,38,31,.08);
-    }
-    .glossaryStrip .status { margin-right:2px; font-weight:650; color:#34423b; }
-    .fieldGlossary { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
-    .termLabel { display:inline-flex; flex-wrap:wrap; gap:5px; align-items:baseline; line-height:1.25; }
-    .termLabel .termCode { color:#172033; font-weight:720; font-family:var(--mono); }
-    .termLabel .termZh { color:var(--accent); font-size:12px; font-weight:650; }
-    .termHint {
-      display:inline-flex;
-      align-items:center;
-      min-height:22px;
-      border:1px solid rgba(22,116,107,.18);
-      border-radius:999px;
-      background:rgba(22,116,107,.08);
-      color:#245c55;
-      padding:2px 8px;
-      font-size:12px;
-      font-weight:650;
-      box-shadow:inset 0 1px 0 rgba(255,255,255,.72);
-    }
     .keyFilter select { width:100%; }
-    .inlineEditCell { background:var(--panel-soft); padding:12px 14px; white-space:normal; }
+    .inlineEditCell { background:#fbfcff; padding:12px 14px; white-space:normal; }
     .inlineEditBox { display:grid; gap:10px; min-width:720px; }
     .inlineEditGrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px; }
     .inlineEditGrid label { display:grid; gap:5px; color:var(--muted); font-size:13px; }
@@ -5579,167 +4473,24 @@ INDEX_HTML = r"""
     .inlineEditGrid textarea { min-height:72px; resize:vertical; grid-column:1 / -1; }
     .inlineEditActions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
     .indexSqlArea { width:100%; min-height:150px; }
-    .transactionArea { width:100%; min-height:130px; }
-    .box {
-      max-height:260px;
-      overflow:auto;
-      border:1px solid var(--line);
-      border-radius:6px;
-      background:#fffdfa;
-      padding:10px;
-      font-family:var(--mono);
-      font-size:13px;
-      line-height:1.48;
-      white-space:normal;
-    }
-    .box h2 { margin:8px 0 6px; font-size:15px; font-family:var(--ui); }
-    .transactionQueueBox { display:grid; gap:8px; border:1px solid var(--line); border-radius:6px; background:rgba(255,255,255,.72); padding:10px; }
-    .queueList { display:grid; gap:6px; max-height:160px; overflow:auto; }
-    .queueItem { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto; gap:8px; align-items:center; border:1px solid var(--line); border-radius:6px; background:#fff; padding:7px 8px; }
-    .queueItem strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .queueItem .status { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .txnChartWrap { overflow:auto; border:1px solid var(--line); border-radius:6px; background:#fffdfa; padding:10px; margin:8px 0 12px; }
-    .txnSvg { display:block; min-width:860px; width:100%; height:auto; font-family:var(--ui); }
-    .txnSvg text { fill:#536174; font-size:12px; }
-    .txnSvg .laneLabel { fill:#172033; font-weight:700; font-size:13px; }
-    .txnSvg .axis { stroke:#cfd8e6; stroke-width:1; }
-    .txnSvg .gridLine { stroke:#e6ebf2; stroke-width:1; }
-    .txnSvg .txnDurationBar { fill:#1f766f; opacity:.92; filter:drop-shadow(0 2px 3px rgba(31,118,111,.25)); }
-    #transactionResult { max-height:none; min-height:300px; }
-    #dbObjectResult {
-      width:100%;
-      max-width:100%;
-      min-width:0;
-      max-height:none;
-      min-height:520px;
-      overflow:visible;
-      font-family:var(--ui);
-      font-size:14px;
-      line-height:1.55;
-    }
-    #dbObjectResult .tableWrap {
-      width:100%;
-      max-width:100%;
-      min-width:0;
-      display:block;
-      max-height:none;
-      overflow:auto;
-      padding-bottom:10px;
-      scrollbar-gutter:stable both-edges;
-    }
-    #dbObjectResult table { min-width:max-content; }
-    #dbObjectResult .sqlBlock {
-      margin:10px 0 12px;
-      border:1px solid var(--line);
-      border-radius:6px;
-      background:rgba(255,255,255,.76);
-      overflow:hidden;
-    }
-    #dbObjectResult .sqlBlock summary {
-      cursor:pointer;
-      list-style:none;
-      padding:10px 12px;
-      color:#263229;
-      font-family:var(--ui);
-      font-weight:680;
-      border-bottom:1px solid transparent;
-    }
-    #dbObjectResult .sqlBlock summary::-webkit-details-marker { display:none; }
-    #dbObjectResult .sqlBlock summary::before { content:"+"; display:inline-block; width:16px; color:var(--accent); }
-    #dbObjectResult .sqlBlock[open] summary { border-bottom-color:var(--line); }
-    #dbObjectResult .sqlBlock[open] summary::before { content:"-"; }
-    #dbObjectResult pre {
-      margin:0;
-      max-height:300px;
-      overflow:auto;
-      white-space:pre-wrap;
-      overflow-wrap:anywhere;
-      word-break:break-word;
-      border:0;
-      background:#fff;
-      padding:10px 12px;
-      font-family:Consolas,monospace;
-      font-size:12px;
-      line-height:1.5;
-      color:#172033;
-    }
-    #dbObjectResult .sqlBlock pre,
-    #governanceResult .sqlBlock pre {
-      white-space:pre-wrap;
-      overflow-x:auto;
-      overflow-wrap:anywhere;
-      word-break:break-word;
-      font-family:Consolas,var(--mono);
-    }
-    #adminReviewFilterBox { display:none; margin-bottom:10px; }
-    #adminReviewFilterBox.visible { display:grid; }
-    #adminResult { max-height:none; height:calc(100vh - 260px); min-height:420px; overflow:auto; }
-    #adminResult .tableWrap { max-height:calc(100vh - 340px); overflow:auto; padding-bottom:8px; scrollbar-gutter:stable both-edges; }
-    #adminResult table { width:100%; min-width:100%; table-layout:auto; }
-    #adminResult th,#adminResult td {
-      min-width:92px;
-      max-width:280px;
-      white-space:normal;
-      overflow-wrap:anywhere;
-      word-break:break-word;
-      vertical-align:top;
-      line-height:1.45;
-    }
-    #adminResult th { min-width:110px; }
-    #adminResult td:has(.rowActions),#adminResult th:first-child { min-width:96px; width:96px; white-space:nowrap; }
-    #adminResult .rowActions { flex-wrap:wrap; }
+    .transactionArea { width:100%; min-height:120px; }
+    .box { max-height:260px; overflow:auto; border:1px solid var(--line); border-radius:6px; background:#fbfcff; padding:10px; font-family:Consolas,monospace; font-size:13px; line-height:1.45; white-space:normal; }
+    .box h2 { margin:8px 0 6px; font-size:15px; }
+    #adminResult { max-height:calc(100vh - 220px); min-height:360px; }
     #governanceResult { max-height:none; height:calc(100vh - 260px); min-height:360px; overflow:auto; }
     #mainTableResult { max-height:none; min-height:360px; overflow:auto; }
     #governanceResult .tableWrap,#mainTableResult .tableWrap { max-height:calc(100vh - 350px); overflow:auto; padding-bottom:8px; }
-    .tableWrap { overflow:auto; border:1px solid var(--line); border-radius:6px; max-width:100%; padding-bottom:6px; background:#fff; }
+    .tableWrap { overflow:auto; border:1px solid var(--line); border-radius:6px; max-width:100%; padding-bottom:6px; }
     table { width:100%; min-width:max-content; border-collapse:collapse; font-size:13px; background:#fff; }
     th,td { border-bottom:1px solid var(--line); padding:9px 10px; text-align:left; white-space:nowrap; }
-    th { position:sticky; top:0; background:#f1f4ef; z-index:1; color:#3a4338; }
-    th .tableFieldName { display:inline-block; font-weight:750; color:#26352f; }
-    th .tableFieldMeaning { display:inline-block; margin-top:3px; font-size:12px; font-weight:550; color:var(--muted); }
-    tbody tr:hover td { background:#fbf7ec; }
-    .panel:hover,.chartSection:hover,.versionInfoSection:hover,main > section:hover {
-      border-color:rgba(22,116,107,.24);
-      box-shadow:0 20px 48px rgba(33,38,31,.16);
-    }
+    th { position:sticky; top:0; background:#f3f5f9; z-index:1; }
     .rowActions { display:flex; gap:6px; align-items:center; }
-    .rowActions .rowDeleteBtn { color:var(--danger); border-color:#efc2bd; }
-    .danger { color:var(--danger); font-weight:700; }
-    .chartSection::before {
-      content:"";
-      position:absolute;
-      inset:10px 10px auto auto;
-      width:76px;
-      height:2px;
-      border-radius:999px;
-      background:linear-gradient(90deg,var(--accent),var(--accent-2));
-      opacity:.72;
-    }
-    .page.active > .panel,
-    .page.active > .governancePanel,
-    .page.active > .batchPanel,
-    .page.active > .transactionPanel,
-    .page.active > .dbObjectPanel,
-    .page.active > .adminPanel {
-      animation:panelRise .28s ease both;
-    }
-    @keyframes panelRise {
-      from { opacity:.72; transform:translateY(8px); }
-      to { opacity:1; transform:translateY(0); }
-    }
-    @media (max-width:1100px){
-      .app{grid-template-columns:1fr;}
-      aside{height:auto;min-height:360px;border-right:0;border-bottom:1px solid rgba(255,255,255,.14);}
-      main{height:100vh;min-height:0;overflow-y:auto;}
-      .grid,.splitPage{grid-template-columns:1fr;grid-template-rows:auto;}
-      .top,.formRow,.sqlRow,.createRow{grid-template-columns:1fr;}
-      .userMenu{justify-content:flex-start; flex-wrap:wrap;}
-      .metrics{grid-template-columns:repeat(2,minmax(0,1fr));}
-      .pageTabs{position:sticky;top:0;margin:0 -20px 16px;background:#edf1ee;z-index:200;}
-    }
+    .rowActions .rowDeleteBtn { color:var(--danger); border-color:#f0b8b3; }
+    .danger { color:var(--danger); font-weight:600; }
+    @media (max-width:980px){ .app{grid-template-columns:1fr;} aside{min-height:360px;border-right:0;border-bottom:1px solid var(--line);} .grid,.splitPage{grid-template-columns:1fr;grid-template-rows:auto;} .top,.formRow,.sqlRow,.createRow{grid-template-columns:1fr;} .userMenu{justify-content:flex-start; flex-wrap:wrap;} .metrics{grid-template-columns:repeat(2,minmax(0,1fr));} }
   </style>
 </head>
-<body data-ui-redesign="aurora-command">
+<body>
 <div class="authGate" id="authGate">
   <div class="authCard">
     <div>
@@ -5763,14 +4514,14 @@ INDEX_HTML = r"""
   </aside>
   <main>
     <div class="pageTabs">
-      <button class="tabBtn active" data-tab="overview">总览驾驶舱</button>
-      <button class="tabBtn" data-tab="governance">数据治理</button>
-      <button class="tabBtn" data-tab="batch">批量导入</button>
-      <button class="tabBtn" data-tab="sql">SQL 工作台</button>
+      <button class="tabBtn active" data-tab="overview">翼型总览</button>
+      <button class="tabBtn" data-tab="sql">SQL 查询</button>
       <button class="tabBtn" data-tab="index">索引实验</button>
       <button class="tabBtn" data-tab="transaction">事务实验</button>
-      <button class="tabBtn" data-tab="dbobjects">数据库对象</button>
-      <button class="tabBtn" data-tab="admin">管理审计</button>
+      <button class="tabBtn" data-tab="dbobjects">数据库对象实验</button>
+      <button class="tabBtn" data-tab="governance">主数据表</button>
+      <button class="tabBtn" data-tab="admin">管理与日志</button>
+      <button class="tabBtn" data-tab="batch">批量导入</button>
     </div>
     <div class="page active fullPage" id="pageOverview"></div>
     <div class="page fullPage" id="pageSql"></div>
@@ -5829,7 +4580,6 @@ INDEX_HTML = r"""
             <button class="action" id="loadMainTableBtn">查看主表</button>
           </div>
         </div>
-        <div class="indexColumnBox keyFilterBox" id="adminReviewFilterBox"></div>
         <div class="box" id="adminResult">engineer/admin 可查看 users、query_logs 与主数据表。</div>
         <div class="createRow" id="adminCreateUserRow">
           <input id="adminNewUsername" placeholder="new username">
@@ -5880,9 +4630,9 @@ INDEX_HTML = r"""
         <div class="toolbar"><h2>性能记录修改</h2><div class="status">engineer/admin 可用，UPDATE 会触发审计日志</div></div>
         <div class="createRow">
           <input id="editPerfId" placeholder="perf_id">
-          <input id="editCl" placeholder="CL（升力系数）">
-          <input id="editCd" placeholder="CD（阻力系数）">
-          <input id="editCm" placeholder="CM（力矩系数）">
+          <input id="editCl" placeholder="cl">
+          <input id="editCd" placeholder="cd">
+          <input id="editCm" placeholder="cm">
           <select id="editIsAnomaly"><option value="0">normal</option><option value="1">anomaly</option></select>
           <button class="action primary" id="updatePerformanceBtn">更新 Performance</button>
         </div>
@@ -5916,16 +4666,16 @@ INDEX_HTML = r"""
         <div id="mainTableSection">
           <div class="toolbar">
             <h2>工况反查翼型与版本</h2>
-            <div class="status">按 <span class="termHint">Re/雷诺数</span>、<span class="termHint">alpha_deg/攻角</span>、<span class="termHint">CL/升力系数</span>、<span class="termHint">CD/阻力系数</span>、<span class="termHint">CL/CD/升阻比</span> 查询满足要求的 airfoils 与 data_versions</div>
+            <div class="status">按 Re、攻角、CL、CD、CL/CD 查询满足要求的 airfoils 与 data_versions</div>
           </div>
           <div class="indexColumnBox keyFilterBox" id="conditionSearchBox">
-            <div class="keyFilter"><span class="termLabel"><span class="termCode">Reynolds number</span><span class="termZh">雷诺数</span></span><input id="conditionRe" placeholder="100000"></div>
-            <div class="keyFilter"><span class="termLabel"><span class="termCode">alpha_deg</span><span class="termZh">攻角，度</span></span><input id="conditionAlpha" placeholder="6"></div>
-            <div class="keyFilter"><span class="termLabel"><span class="termCode">CL min</span><span class="termZh">最小升力系数</span></span><input id="conditionClMin" placeholder="0.5"></div>
-            <div class="keyFilter"><span class="termLabel"><span class="termCode">CL max</span><span class="termZh">最大升力系数</span></span><input id="conditionClMax" placeholder="optional"></div>
-            <div class="keyFilter"><span class="termLabel"><span class="termCode">CD min</span><span class="termZh">最小阻力系数</span></span><input id="conditionCdMin" placeholder="optional"></div>
-            <div class="keyFilter"><span class="termLabel"><span class="termCode">CD max</span><span class="termZh">最大阻力系数</span></span><input id="conditionCdMax" placeholder="0.05"></div>
-            <div class="keyFilter"><span class="termLabel"><span class="termCode">CL/CD min</span><span class="termZh">最小升阻比</span></span><input id="conditionLdMin" placeholder="optional"></div>
+            <div class="keyFilter"><span>Reynolds number</span><input id="conditionRe" placeholder="100000"></div>
+            <div class="keyFilter"><span>alpha_deg</span><input id="conditionAlpha" placeholder="6"></div>
+            <div class="keyFilter"><span>CL min</span><input id="conditionClMin" placeholder="0.5"></div>
+            <div class="keyFilter"><span>CL max</span><input id="conditionClMax" placeholder="optional"></div>
+            <div class="keyFilter"><span>CD min</span><input id="conditionCdMin" placeholder="optional"></div>
+            <div class="keyFilter"><span>CD max</span><input id="conditionCdMax" placeholder="0.05"></div>
+            <div class="keyFilter"><span>CL/CD min</span><input id="conditionLdMin" placeholder="optional"></div>
             <div class="keyFilter"><span>异常记录</span><select id="conditionAnomalyMode"><option value="normal">排除异常</option><option value="include">包含异常</option><option value="only">只看异常</option></select></div>
             <div class="keyFilter"><span>limit</span><select id="conditionLimit"><option value="50">50 rows</option><option value="100" selected>100 rows</option><option value="300">300 rows</option></select></div>
             <div class="keyFilter"><span>&nbsp;</span><button class="action primary" id="runConditionSearchBtn">查询满足条件的翼型</button></div>
@@ -5955,7 +4705,7 @@ INDEX_HTML = r"""
         <div class="experimentControls">
           <button class="action" id="concurrencyScenarioBtn">场景1：并发修改同一性能记录</button>
           <button class="action" id="bulkImportScenarioBtn">场景2：批量导入失败回滚</button>
-          <button class="action" id="versionScenarioBtn">场景3：主表键级联更新版本表</button>
+          <button class="action" id="versionScenarioBtn">场景3：主表与版本表同时失败</button>
         </div>
         <div class="experimentControls">
           <input id="savedTransactionTitle" placeholder="transaction title">
@@ -5974,19 +4724,6 @@ WHERE airfoil_id = 'ag03';</textarea>
         <div class="experimentControls">
           <button class="action primary" id="rollbackTransactionBtn">执行并回滚</button>
           <button class="action" id="commitTransactionBtn">执行并提交</button>
-        </div>
-        <div class="transactionQueueBox">
-          <div class="toolbar">
-            <h2>有序事务列表</h2>
-            <div class="status">按列表顺序逐个 BEGIN / SQL / COMMIT 或 ROLLBACK</div>
-          </div>
-          <div class="experimentControls">
-            <button class="action" id="addSavedToQueueBtn">加入列表</button>
-            <button class="action" id="clearTransactionQueueBtn">清空列表</button>
-            <button class="action primary" id="runQueueRollbackBtn">运行列表并回滚</button>
-            <button class="action" id="runQueueCommitBtn">运行列表并提交</button>
-          </div>
-          <div class="queueList" id="transactionQueueList">事务列表为空。先保存事务，再从下拉框加入列表。</div>
         </div>
         <div class="box" id="transactionResult">事务实验结果会显示在这里。</div>
       </div>
@@ -6036,23 +4773,13 @@ WHERE airfoil_id = 'ag03';</textarea>
       <div class="titlebar"><h1 id="airfoilTitle">选择一个翼型</h1><div class="sub" id="airfoilMeta">坐标、性能和异常记录会显示在这里</div></div>
       <div class="versionBox"><h2>版本</h2><select id="versionSelect"></select></div>
     </div>
-    <div class="glossaryStrip" aria-label="性能字段说明">
-      <span class="status">性能字段</span>
-      <span class="termHint">Reynolds number（雷诺数）</span>
-      <span class="termHint">alpha_deg（攻角，度）</span>
-      <span class="termHint">CL（升力系数）</span>
-      <span class="termHint">CD（阻力系数）</span>
-      <span class="termHint">CM（力矩系数）</span>
-      <span class="termHint">CL/CD（升阻比）</span>
-    </div>
     <div class="grid">
-      <section class="chartSection shapeSection"><div class="toolbar"><h2>二维轮廓</h2><div class="status" id="coordStatus">-</div></div><div class="shapeLegend"><span class="legendItem" style="color:#1f766f"><span class="legendMark"></span>upper 正面</span><span class="legendItem" style="color:#2563a6"><span class="legendMark"></span>lower 反面</span><span class="legendItem" style="color:#b25d2a"><span class="legendDiamond"></span>augmented 增强点</span><span class="legendItem" style="color:#b42318"><span class="legendRing"></span>anomaly 异常提示</span></div><canvas id="shapeCanvas"></canvas><div class="chartTooltip" id="shapeTooltip"></div></section>
-      <section class="chartSection"><div class="toolbar"><h2>CL（升力系数）-alpha（攻角）曲线</h2><select id="reSelect"></select></div><canvas id="perfCanvas"></canvas><div class="chartTooltip" id="perfTooltip"></div></section>
-      <section class="chartSection"><div class="toolbar"><h2>CD（阻力系数）-alpha（攻角）曲线</h2><select id="cdReSelect"></select></div><canvas id="cdCanvas"></canvas><div class="chartTooltip" id="cdTooltip"></div></section>
-      <section class="chartSection"><div class="toolbar"><h2>CL/CD（升阻比）-alpha（攻角）曲线</h2><select id="ldReSelect"></select></div><canvas id="ldCanvas"></canvas><div class="chartTooltip" id="ldTooltip"></div></section>
-      <section class="chartSection"><div class="toolbar"><h2>坐标点类型占比</h2><div class="status" id="coordPieStatus">real / augmented</div></div><canvas id="coordPieCanvas"></canvas></section>
-      <section class="chartSection wideChartSection"><div class="toolbar"><h2>同一 Re（雷诺数）下多翼型性能对比</h2><div class="experimentControls"><select id="compareReSelect"><option value="50000">Re 50,000（雷诺数）</option><option value="100000">Re 100,000（雷诺数）</option><option value="200000">Re 200,000（雷诺数）</option><option value="500000">Re 500,000（雷诺数）</option></select><button class="action primary compareMetricBtn" data-metric="max_cl">最大 CL（升力系数）</button><button class="action compareMetricBtn" data-metric="min_cd">最小 CD（阻力系数）</button><button class="action compareMetricBtn" data-metric="max_ld">最大 CL/CD（升阻比）</button><button class="action compareMetricBtn" data-metric="avg_cl">平均 CL（升力系数）</button></div></div><div class="compareScroll" id="compareScroll"><canvas id="compareCanvas"></canvas></div><div class="chartTooltip" id="compareTooltip"></div></section>
-      <section class="chartSection wideChartSection"><div class="toolbar"><h2>不同版本翼型性能差异图</h2><div class="status" id="versionDiffStatus">当前翼型版本对比</div></div><div class="versionDiffScroll" id="versionDiffScroll"><canvas id="versionDiffCanvas"></canvas></div><div class="chartTooltip" id="versionDiffTooltip"></div></section>
+      <section class="chartSection"><div class="toolbar"><h2>二维轮廓</h2><div class="status" id="coordStatus">-</div></div><canvas id="shapeCanvas"></canvas><div class="chartTooltip" id="shapeTooltip"></div></section>
+      <section class="chartSection"><div class="toolbar"><h2>CL-alpha 曲线</h2><select id="reSelect"></select></div><canvas id="perfCanvas"></canvas><div class="chartTooltip" id="perfTooltip"></div></section>
+      <section class="chartSection"><div class="toolbar"><h2>CD-alpha 曲线</h2><select id="cdReSelect"></select></div><canvas id="cdCanvas"></canvas><div class="chartTooltip" id="cdTooltip"></div></section>
+      <section class="chartSection"><div class="toolbar"><h2>CL/CD-alpha 曲线</h2><select id="ldReSelect"></select></div><canvas id="ldCanvas"></canvas><div class="chartTooltip" id="ldTooltip"></div></section>
+      <section class="chartSection wideChartSection"><div class="toolbar"><h2>同一 Re 下多翼型性能对比</h2><div class="experimentControls"><select id="compareReSelect"><option value="50000">Re 50,000</option><option value="100000">Re 100,000</option><option value="200000">Re 200,000</option><option value="500000">Re 500,000</option></select><button class="action primary compareMetricBtn" data-metric="max_cl">最大 CL</button><button class="action compareMetricBtn" data-metric="min_cd">最小 CD</button><button class="action compareMetricBtn" data-metric="max_ld">最大 CL/CD</button><button class="action compareMetricBtn" data-metric="avg_cl">平均 CL</button></div></div><canvas id="compareCanvas"></canvas><div class="chartTooltip" id="compareTooltip"></div></section>
+      <section class="chartSection wideChartSection"><div class="toolbar"><h2>不同版本翼型性能差异图</h2><div class="status" id="versionDiffStatus">当前翼型版本对比</div></div><canvas id="versionDiffCanvas"></canvas><div class="chartTooltip" id="versionDiffTooltip"></div></section>
       <section class="versionInfoSection">
         <div class="toolbar"><h2>版本信息</h2><div class="status" id="perfStatus">-</div></div>
         <div class="versionContent">
@@ -6096,12 +4823,12 @@ ORDER BY alpha_deg</textarea>
     </div>
     <section>
       <div class="toolbar"><h2>异常记录</h2><div class="status" id="anomalyStatus">-</div></div>
-      <div class="tableWrap"><table><thead><tr><th>ID</th><th>规则</th><th>alpha（攻角）</th><th>Re（雷诺数）</th><th>CL（升力系数）</th><th>CD（阻力系数）</th></tr></thead><tbody id="anomalyRows"></tbody></table></div>
+      <div class="tableWrap"><table><thead><tr><th>ID</th><th>规则</th><th>alpha</th><th>Re</th><th>CL</th><th>CD</th></tr></thead><tbody id="anomalyRows"></tbody></table></div>
     </section>
   </main>
 </div>
 <script>
-const state={airfoils:[],selectedAirfoil:null,selectedVersion:1,versions:[],selectedRe:50000,compareMetric:"max_cl",coordinates:[],performance:[],anomalies:[],currentUser:null,savedTransactions:[],transactionQueue:[],shapeScreen:[],perfScreen:[],cdScreen:[],ldScreen:[],compareScreen:[],versionDiffScreen:[],appDataLoaded:false,mainFilterCache:{},secondaryChartTimer:null,governanceScenario:null,adminReviewRequestId:0,adminReviewLoading:false};
+const state={airfoils:[],selectedAirfoil:null,selectedVersion:1,versions:[],selectedRe:50000,compareMetric:"max_cl",coordinates:[],performance:[],anomalies:[],currentUser:null,savedTransactions:[],shapeScreen:[],perfScreen:[],cdScreen:[],ldScreen:[],compareScreen:[],versionDiffScreen:[],appDataLoaded:false,mainFilterCache:{},secondaryChartTimer:null};
 const $=id=>document.getElementById(id);
 function on(id,event,handler){const el=$(id); if(el&&!el.dataset[`bound${event}`]){el.addEventListener(event,handler);el.dataset[`bound${event}`]="1";}}
 const DEFAULT_TRANSACTION_SQL=`UPDATE airfoils
@@ -6114,179 +4841,23 @@ WHERE airfoil_id = 'ag03';`;
 async function getJson(url){const r=await fetch(url); if(!r.ok) throw new Error(await r.text()); return await r.json();}
 async function postJson(url,body={}){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); const data=await r.json(); if(!r.ok) throw data; return data;}
 function num(v,d=4){const n=Number(v); return Number.isFinite(n)?n.toFixed(d):"-";}
-const FIELD_LABELS={
-  user_id:"user_id（用户编号）",
-  username:"username（用户名）",
-  role:"role（角色）",
-  created_at:"created_at（创建时间）",
-  log_id:"log_id（查询日志编号）",
-  sql_text:"sql_text（SQL全文）",
-  is_valid:"is_valid（是否有效）",
-  elapsed_ms:"elapsed_ms（耗时ms）",
-  row_count:"row_count（结果行数）",
-  operation_type:"operation_type（操作类型）",
-  table_name:"table_name（关系名）",
-  record_pk:"record_pk（记录主键）",
-  old_values:"old_values（修改前数据）",
-  new_values:"new_values（修改后数据）",
-  performed_by_user_id:"performed_by_user_id（执行用户编号）",
-  performed_by_username:"performed_by_username（执行用户名）",
-  performed_at:"performed_at（执行时间）",
-  audit_id:"audit_id（审计编号）",
-  lineage_id:"lineage_id（追溯编号）",
-  source_record_pk:"source_record_pk（来源记录主键）",
-  current_record_version_id:"current_record_version_id（当前记录版本）",
-  previous_record_version_id:"previous_record_version_id（上一记录版本）",
-  record_version_id:"record_version_id（记录版本）",
-  is_modified:"is_modified（是否被修改）",
-  last_modified_at:"last_modified_at（最后修改时间）",
-  last_operation:"last_operation（最后操作）",
-  modified_by_user_id:"modified_by_user_id（修改用户编号）",
-  modified_by_username:"modified_by_username（修改用户名）",
-  modified_count:"modified_count（修改次数）",
-  delete_id:"delete_id（删除记录编号）",
-  delete_reason:"delete_reason（删除原因）",
-  deleted_at:"deleted_at（删除时间）",
-  deleted_by_user_id:"deleted_by_user_id（删除用户编号）",
-  deleted_by_username:"deleted_by_username（删除用户名）",
-  is_active:"is_active（是否仍处于删除状态）",
-  restored_at:"restored_at（恢复时间）",
-  restored_by_user_id:"restored_by_user_id（恢复用户编号）",
-  restored_by_username:"restored_by_username（恢复用户名）",
-  row_snapshot:"row_snapshot（删除前完整数据）",
-  import_id:"import_id（导入记录编号）",
-  import_method:"import_method（导入方式）",
-  import_source:"import_source（导入来源）",
-  imported_at:"imported_at（导入时间）",
-  imported_by_user_id:"imported_by_user_id（导入用户编号）",
-  imported_by_username:"imported_by_username（导入用户名）",
-  affected_rows:"affected_rows（影响行数）",
-  batch_id:"batch_id（批次编号）",
-  source_type:"source_type（来源类型）",
-  source_name:"source_name（来源名称）",
-  source_url:"source_url（来源链接）",
-  description:"description（说明）",
-  airfoil_id:"airfoil_id（翼型编号）",
-  name:"name（名称）",
-  source:"source（数据来源）",
-  family:"family（翼型族类）",
-  is_generated:"is_generated（是否生成数据）",
-  source_file:"source_file（源文件）",
-  has_augmented_coordinates:"has_augmented_coordinates（是否补点）",
-  original_point_count:"original_point_count（原始坐标点数）",
-  final_point_count:"final_point_count（最终坐标点数）",
-  version_id:"version_id（数据集版本）",
-  version_type:"version_type（版本类型）",
-  coordinate_source_type:"coordinate_source_type（坐标来源类型）",
-  point_order:"point_order（点序号）",
-  x:"x（横坐标）",
-  y:"y（纵坐标）",
-  surface:"surface（上下表面）",
-  point_source:"point_source（点来源）",
-  is_augmented:"is_augmented（是否补点）",
-  original_order:"original_order（原始序号）",
-  augmentation_method:"augmentation_method（补点方法）",
-  perf_id:"perf_id（性能记录编号）",
-  is_anomaly:"is_anomaly（是否异常）",
-  anomaly_id:"anomaly_id（异常编号）",
-  rule_type:"rule_type（异常规则）",
-  detail:"detail（详情）",
-  alpha:"alpha（攻角）",
-  alpha_deg:"alpha_deg（攻角，度）",
-  reynolds_number:"Reynolds number（雷诺数）",
-  cl:"CL（升力系数）",
-  cd:"CD（阻力系数）",
-  cm:"CM（力矩系数）",
-  lift_drag_ratio:"CL/CD（升阻比）",
-  max_cl:"最大CL（升力系数）",
-  min_cd:"最小CD（阻力系数）",
-  max_ld:"最大CL/CD（升阻比）",
-  avg_cl:"平均CL（升力系数）",
-  imported_count:"imported_count（成功导入数）",
-  invalid_count:"invalid_count（非法记录数）",
-  status:"status（状态）",
-  validation_error:"validation_error（校验错误）",
-  staging_id:"staging_id（暂存记录编号）",
-  sample_count:"sample_count（样本数）",
-  anomaly_count:"anomaly_count（异常数）",
-  max_lift_drag_ratio:"max_lift_drag_ratio（最大升阻比）",
-  metric_name:"metric_name（指标名）",
-  metric_value:"metric_value（指标值）",
-  airfoil_name:"airfoil_name（翼型名称）"
-};
-function fieldLabel(name){return FIELD_LABELS[name]||name;}
-function tableHeaderLabel(name){
-  const label=String(fieldLabel(name));
-  const splitAt=label.indexOf("（");
-  if(splitAt<=0)return escapeHtml(label);
-  const english=label.slice(0,splitAt).trim();
-  const chinese=label.slice(splitAt).trim();
-  return `<span class="tableFieldName">${escapeHtml(english)}</span><br><span class="tableFieldMeaning">${escapeHtml(chinese)}</span>`;
-}
-function fieldGlossaryHtml(fields){
-  const items=(fields||[]).filter(name=>FIELD_LABELS[name]).map(name=>`<span class="termHint">${escapeHtml(FIELD_LABELS[name])}</span>`);
-  return items.length?`<br><b>字段含义：</b><span class="fieldGlossary">${items.join("")}</span>`:"";
-}
-function metricLabel(metric){
-  return {
-    max_cl:"最大CL（升力系数）",
-    min_cd:"最小CD（阻力系数）",
-    max_ld:"最大CL/CD（升阻比）",
-    avg_cl:"平均CL（升力系数）"
-  }[metric]||metric;
-}
 function isManager(){const u=state.currentUser; return u&&(u.role==="engineer"||u.role==="admin");}
 function isAdmin(){return state.currentUser&&state.currentUser.role==="admin";}
 function canUseMainData(){const u=state.currentUser; return u&&(u.role==="analyst"||u.role==="engineer"||u.role==="admin");}
 function escapeHtml(value){return String(value??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));}
-function formatSqlForDisplay(sql){
-  let text=String(sql??"").replace(/\r\n/g,"\n").replace(/\s+/g," ").trim();
-  const breaks=[
-    "CREATE VIEW","CREATE TRIGGER","CREATE PROCEDURE","SQL SECURITY"," AS SELECT "," SELECT "," FROM "," LEFT JOIN "," RIGHT JOIN "," INNER JOIN "," JOIN ",
-    " WHERE "," GROUP BY "," ORDER BY "," HAVING "," LIMIT "," VALUES "," SET "," ON DUPLICATE KEY UPDATE "," BEGIN "," END"," INSERT INTO "," UPDATE "," DELETE FROM ",
-    " AND "," OR "
-  ];
-  breaks.forEach(keyword=>{
-    const escaped=keyword.trim().replace(/[.*+?^${}()|[\]\\]/g,"\\$&").replace(/\s+/g,"\\s+");
-    const pattern=new RegExp(`\\s+${escaped}\\s+`,"gi");
-    const replacement=`\n${keyword.trim()} `;
-    text=text.replace(pattern,replacement);
-  });
-  text=text
-    .replace(/,\s*/g,",\n    ")
-    .replace(/\(\s*SELECT\s+/gi,"(\nSELECT ")
-    .replace(/\)\s*SELECT\s+/gi,")\nSELECT ")
-    .replace(/\n{3,}/g,"\n\n")
-    .trim();
-  return text;
-}
-function sqlPre(sql){return `<pre>${escapeHtml(formatSqlForDisplay(sql))}</pre>`;}
 function rowsToTable(rows,options={}){
   if(!rows||!rows.length)return "<div class='status'>No rows</div>";
   const cols=Object.keys(rows[0]);
   const editableTable=isManager()&&["data_sources","airfoils","data_versions","coordinate_points","performance_records","anomaly_records"].includes(options.table);
   const restorableTable=isAdmin()&&options.table==="soft_delete_records";
-  const adminRecordButtons=r=>{
-    if(!isAdmin()||!editableTable)return "";
-    const payload=escapeHtml(JSON.stringify(r));
-    return [
-      `<button class="action rowAdminTraceBtn" data-review-table="data_import_records" data-table="${escapeHtml(options.table)}" data-row="${payload}">来源</button>`,
-      `<button class="action rowAdminTraceBtn" data-review-table="data_record_lineage" data-table="${escapeHtml(options.table)}" data-row="${payload}">追溯</button>`,
-      `<button class="action rowAdminTraceBtn" data-review-table="audit_logs" data-table="${escapeHtml(options.table)}" data-row="${payload}">审计</button>`
-    ].join("");
-  };
   const actionCell=r=>{
     if(editableTable){
       const payload=escapeHtml(JSON.stringify(r));
-      return `<td><div class="rowActions"><button class="action rowEditBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">编辑</button><button class="action rowDeleteBtn mainRowDeleteBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">删除</button>${adminRecordButtons(r)}</div></td>`;
+      return `<td><div class="rowActions"><button class="action rowEditBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">编辑</button><button class="action rowDeleteBtn mainRowDeleteBtn" data-table="${escapeHtml(options.table)}" data-row="${payload}">删除</button></div></td>`;
     }
     if(restorableTable){
       const active=String(r.is_active??"0")==="1";
       return `<td><div class="rowActions">${active?`<button class="action restoreDeleteBtn" data-delete-id="${escapeHtml(r.delete_id)}" data-table="${escapeHtml(r.table_name||"")}" data-record-pk="${escapeHtml(r.record_pk||"")}">恢复</button>`:`<span class="status">已恢复</span>`}</div></td>`;
-    }
-    if(options.table==="data_record_lineage"){
-      const payload=escapeHtml(JSON.stringify(r));
-      return `<td><div class="rowActions"><button class="action lineageToAuditBtn" data-row="${payload}">查看审计</button></div></td>`;
     }
     return "";
   };
@@ -6298,43 +4869,16 @@ function rowsToTable(rows,options={}){
     }
     return `<td>${escapeHtml(r[c])}</td>`;
   };
-  const actionHead=(editableTable||restorableTable||options.table==="data_record_lineage")?"<th>操作</th>":"";
-  return `<div class="tableWrap"><table><thead><tr>${actionHead}${cols.map(c=>`<th>${tableHeaderLabel(c)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${actionCell(r)}${cols.map(c=>cell(r,c)).join("")}</tr>`).join("")}</tbody></table></div>`;
+  const actionHead=(editableTable||restorableTable)?"<th>操作</th>":"";
+  return `<div class="tableWrap"><table><thead><tr>${actionHead}${cols.map(c=>`<th>${escapeHtml(c)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${actionCell(r)}${cols.map(c=>cell(r,c)).join("")}</tr>`).join("")}</tbody></table></div>`;
 }
-function noRowsHint(table,target,filters){
-  const filterText=Object.entries(filters||{}).map(([k,v])=>`${fieldLabel(k)}=${v}`).join("，")||"全部";
-  return `<div class="status">没有查到记录。当前审计表：${escapeHtml(table)}；目标关系：${escapeHtml(target)}；筛选条件：${escapeHtml(filterText)}。可以换一个目标关系，或清空上方筛选条件后再查。</div>`;
-}
-function rowRecordPk(table,row){
-  if(table==="data_sources")return row.source_type;
-  if(table==="airfoils")return row.airfoil_id;
-  if(table==="data_versions")return `${row.airfoil_id}#${row.version_id}`;
-  if(table==="coordinate_points")return `${row.airfoil_id}#${row.version_id}#${row.point_order}`;
-  if(table==="performance_records")return row.perf_id;
-  if(table==="anomaly_records")return row.anomaly_id;
-  return row.record_pk||row.id||"";
-}
-function tablePrimaryKeyColumns(table){
-  return {
-    data_sources:["source_type"],
-    airfoils:["airfoil_id"],
-    data_versions:["airfoil_id","version_id"],
-    coordinate_points:["airfoil_id","version_id","point_order"],
-    performance_records:["perf_id"],
-    anomaly_records:["anomaly_id"]
-  }[table]||["record_pk"];
-}
-function buildRecordPkFromFilters(table,values){
-  if(table==="data_sources")return values.source_type||"";
-  if(table==="airfoils")return values.airfoil_id||"";
-  if(table==="data_versions")return values.airfoil_id&&values.version_id?`${values.airfoil_id}#${values.version_id}`:"";
-  if(table==="coordinate_points")return values.airfoil_id&&values.version_id&&values.point_order?`${values.airfoil_id}#${values.version_id}#${values.point_order}`:"";
-  if(table==="performance_records")return values.perf_id||"";
-  if(table==="anomaly_records")return values.anomaly_id||"";
-  return values.record_pk||"";
+function resultCountLabel(data){
+  const shown=Array.isArray(data.rows)?data.rows.length:Number(data.row_count||0);
+  const total=Number(data.total_count??data.total??data.row_count??shown);
+  return total>shown?`Rows: ${shown} / ${total}`:`Rows: ${shown}`;
 }
 function showSqlResult(target,data){
-  const meta=`<h2>执行性能</h2><div class="status">Rows: ${data.row_count} · Time: ${data.elapsed_ms} ms${data.affected_rows==null?"":` · Affected: ${data.affected_rows}`}</div>`;
+  const meta=`<h2>执行性能</h2><div class="status">${resultCountLabel(data)} · Time: ${data.elapsed_ms} ms${data.affected_rows==null?"":` · Affected: ${data.affected_rows}`}</div>`;
   const explain=data.explain&&data.explain.length?`<h2>EXPLAIN</h2>${rowsToTable(data.explain)}`:"";
   target.innerHTML=`${meta}${explain}<h2>Result</h2>${rowsToTable(data.rows)}`;
 }
@@ -6342,14 +4886,11 @@ function resetTransactionEditor(){
   if($("savedTransactionTitle"))$("savedTransactionTitle").value="";
   if($("savedTransactionSelect"))$("savedTransactionSelect").value="";
   if($("transactionSqlInput"))$("transactionSqlInput").value=DEFAULT_TRANSACTION_SQL;
-  state.transactionQueue=[];
-  renderTransactionQueue();
   if($("transactionResult"))$("transactionResult").textContent="事务实验结果会显示在这里。";
 }
 function setupPages(){
   const panel=document.querySelector("main > .panel");
   const top=document.querySelector("main > .top");
-  const glossary=document.querySelector("main > .glossaryStrip");
   const grid=document.querySelector("main > .grid");
   const anomaly=document.querySelector("main > section:last-of-type");
   const indexExperiment=$("indexStatus").closest(".experiment");
@@ -6368,16 +4909,10 @@ function setupPages(){
   $("pageGovernance").appendChild($("editorPanel"));
   $("pageAdmin").appendChild($("adminPanel"));
   $("pageOverview").appendChild(top);
-  if(glossary)$("pageOverview").appendChild(glossary);
   $("pageOverview").appendChild(grid);
   $("pageOverview").appendChild(anomaly);
   document.querySelectorAll(".tabBtn").forEach(btn=>{
-    btn.addEventListener("click",()=>{
-      showPage(btn.dataset.tab);
-      if(btn.dataset.tab==="admin"&&state.adminReviewTable&&!state.adminReviewLoading){
-        openAdminReviewTable(state.adminReviewTable,{reloadFilters:false});
-      }
-    });
+    btn.addEventListener("click",()=>showPage(btn.dataset.tab));
   });
 }
 function showPage(name){
@@ -6387,7 +4922,7 @@ function showPage(name){
   $("appShell").classList.toggle("noAside",name!=="overview");
   hideTooltip("shapeTooltip");hideTooltip("perfTooltip");
   if(name==="governance")showMainTableSection(true);
-  if(name==="overview")setTimeout(()=>{drawShape();drawPerformance();drawCd();drawLd();drawCoordPie();scheduleSecondaryCharts();},0);
+  if(name==="overview")setTimeout(()=>{drawShape();drawPerformance();drawCd();drawLd();scheduleSecondaryCharts();},0);
 }
 async function init(){
   on("logoutBtn","click",logout);
@@ -6407,14 +4942,13 @@ async function init(){
   $("ldCanvas").addEventListener("mouseleave",()=>hideTooltip("ldTooltip"));
   $("compareCanvas").addEventListener("mousemove",handleCompareHover);
   $("compareCanvas").addEventListener("mouseleave",()=>hideTooltip("compareTooltip"));
-  $("versionDiffCanvas").addEventListener("mousemove",handleVersionDiffHover);
+  $("versionDiffCanvas").addEventListener("mousemove",e=>handleSeriesHover(e,"versionDiffCanvas","versionDiffTooltip",state.versionDiffScreen));
   $("versionDiffCanvas").addEventListener("mouseleave",()=>hideTooltip("versionDiffTooltip"));
   $("runSqlBtn").addEventListener("click",runSql);
   document.querySelectorAll(".queryTemplateBtn").forEach(btn=>btn.addEventListener("click",()=>loadQueryTemplate(btn.dataset.template)));
   $("loadUsersBtn").addEventListener("click",loadUsers);
   $("loadLogsBtn").addEventListener("click",loadLogs);
   document.querySelectorAll(".adminTraceBtn").forEach(btn=>btn.addEventListener("click",()=>openAdminReviewTable(btn.dataset.table)));
-  $("adminAuditTargetSelect").addEventListener("change",()=>{if(state.adminReviewTable)openAdminReviewTable(state.adminReviewTable);});
   $("loadMainTableBtn").addEventListener("click",loadMainTable);
   $("runConditionSearchBtn").addEventListener("click",runConditionSearch);
   $("adminTableSelect").addEventListener("change",changeMainTable);
@@ -6431,10 +4965,6 @@ async function init(){
   $("saveTransactionBtn").addEventListener("click",saveCurrentTransaction);
   $("loadSavedTransactionBtn").addEventListener("click",loadSelectedSavedTransaction);
   $("deleteSavedTransactionBtn").addEventListener("click",deleteSelectedSavedTransaction);
-  $("addSavedToQueueBtn").addEventListener("click",addSelectedTransactionToQueue);
-  $("clearTransactionQueueBtn").addEventListener("click",clearTransactionQueue);
-  $("runQueueRollbackBtn").addEventListener("click",()=>runTransactionQueue("rollback"));
-  $("runQueueCommitBtn").addEventListener("click",()=>runTransactionQueue("commit"));
   $("concurrencyScenarioBtn").addEventListener("click",runConcurrencyScenario);
   $("bulkImportScenarioBtn").addEventListener("click",loadBulkImportScenario);
   $("versionScenarioBtn").addEventListener("click",loadVersionAtomicScenario);
@@ -6449,7 +4979,7 @@ async function init(){
   $("showCreateIndexBtn").addEventListener("click",()=>showIndexForm("create"));
   $("createIndexBtn").addEventListener("click",createIndex);
   $("runIndexBtn").addEventListener("click",runIndex);
-  window.addEventListener("resize",()=>{drawShape();drawPerformance();drawCd();drawLd();drawCoordPie();scheduleSecondaryCharts();});
+  window.addEventListener("resize",()=>{drawShape();drawPerformance();drawCd();drawLd();scheduleSecondaryCharts();});
   updateBatchHeaderHint();
   await loadMe();
   if(state.currentUser)await loadAppData();
@@ -6529,18 +5059,7 @@ function updateAuth(userChanged=false){
 async function gateLogin(){try{$("gateMessage").textContent="正在登录...";const data=await postJson("/api/auth/login",{username:$("gateName").value.trim(),password:$("gatePassword").value});await loadMe();$("gateMessage").textContent=`Login ok: ${data.username} (${data.role})`;if(state.currentUser)loadAppData().catch(err=>{$("gateMessage").textContent=`Load data failed: ${err.message||err}`;});}catch(e){$("gateMessage").textContent=`Login failed: ${e.error||"unknown error"}`;}}
 async function gateRegisterViewer(){try{$("gateMessage").textContent="正在注册...";const data=await postJson("/api/auth/register",{username:$("gateName").value.trim(),password:$("gatePassword").value});await loadMe();$("gateMessage").textContent=`Register ok: ${data.username} (${data.role})`;if(state.currentUser)loadAppData().catch(err=>{$("gateMessage").textContent=`Load data failed: ${err.message||err}`;});}catch(e){$("gateMessage").textContent=`Register failed: ${e.error||"unknown error"}`;}}
 async function logout(){try{$("userStatus").textContent="Logging out...";await postJson("/api/auth/logout");}finally{state.currentUser=null; state.appDataLoaded=false; state.airfoils=[]; state.selectedAirfoil=null; $("gatePassword").value=""; updateAuth(true); $("gateMessage").textContent="Logged out"; $("sqlResult").textContent="Logged out";}}
-async function runSql(){
-  try{
-    const sql=$("sqlInput").value;
-    const data=await postJson("/api/query_logs/run",{sql});
-    showSqlResult($("sqlResult"),data);
-    if(/^\s*(insert|update|delete|replace|create|drop|alter)\b/i.test(sql)){
-      refreshMainDataAfterMutation({allTables:true}).catch(err=>console.error(err));
-    }
-  }catch(e){
-    $("sqlResult").textContent=`SQL failed: ${e.error||"unknown error"}`;
-  }
-}
+async function runSql(){try{const data=await postJson("/api/query_logs/run",{sql:$("sqlInput").value});showSqlResult($("sqlResult"),data);}catch(e){$("sqlResult").textContent=`SQL failed: ${e.error||"unknown error"}`;}}
 async function loadQueryTemplate(kind){
   const templates={
     airfoil_summary:`SELECT airfoil_id, name, family, source_type, final_point_count
@@ -6577,7 +5096,6 @@ ORDER BY dv.version_id;`
 }
 async function runDataGovernance(scenario){
   try{
-    state.governanceScenario=scenario;
     showMainTableSection(false);
     $("governanceResult").style.display="block";
     $("governanceResult").textContent="Running data governance check...";
@@ -6590,12 +5108,6 @@ async function runDataGovernance(scenario){
       limit:"80"
     });
     const pieces=[`<div class="status">Scenario=${escapeHtml(d.scenario)} · Time=${d.elapsed_ms} ms</div>`];
-    if(d.sql_blocks&&d.sql_blocks.length){
-      pieces.push("<h2>实验 SQL</h2>");
-      d.sql_blocks.forEach((block,index)=>{
-        pieces.push(`<div class="sqlBlock"><div class="status"><b>SQL ${index+1}：</b>${escapeHtml(block.title||"")}</div>${sqlPre(block.sql||"")}</div>`);
-      });
-    }
     (d.sections||[]).forEach(section=>{
       pieces.push(`<h2>${escapeHtml(section.title)}</h2>`);
       if(section.note){pieces.push(`<div class="status">${escapeHtml(section.note)}</div>`);}
@@ -6606,18 +5118,11 @@ async function runDataGovernance(scenario){
     $("governanceResult").textContent=`Data governance check failed: ${e.error||"unknown error"}`;
   }
 }
-async function refreshCurrentGovernanceResult(){
-  if(!$("pageGovernance")?.classList.contains("active"))return;
-  if($("governanceResult")?.style.display==="none")return;
-  if(!state.governanceScenario)return;
-  await runDataGovernance(state.governanceScenario);
-}
 function showMainTableSection(visible){
   const section=$("mainTableSection");
   if(section)section.style.display=visible?"grid":"none";
 }
 async function showMainTableMode(){
-  state.governanceScenario=null;
   showMainTableSection(true);
   $("governanceResult").style.display="none";
   document.querySelectorAll(".governanceBtn").forEach(b=>b.classList.remove("primary"));
@@ -6648,79 +5153,25 @@ async function runConditionSearch(){
     $("conditionSearchResult").textContent="正在按工况查询满足条件的翼型与版本...";
     const data=await getJson(`/api/condition_search?${params.toString()}`);
     const conditionText=[
-      params.get("reynolds_number")?`Re（雷诺数）= ${escapeHtml(params.get("reynolds_number"))}`:"",
-      params.get("alpha_deg")?`alpha_deg（攻角）= ${escapeHtml(params.get("alpha_deg"))}`:"",
-      params.get("cl_min")?`CL（升力系数）>= ${escapeHtml(params.get("cl_min"))}`:"",
-      params.get("cl_max")?`CL（升力系数）<= ${escapeHtml(params.get("cl_max"))}`:"",
-      params.get("cd_min")?`CD（阻力系数）>= ${escapeHtml(params.get("cd_min"))}`:"",
-      params.get("cd_max")?`CD（阻力系数）<= ${escapeHtml(params.get("cd_max"))}`:"",
-      params.get("ld_min")?`CL/CD（升阻比）>= ${escapeHtml(params.get("ld_min"))}`:"",
+      params.get("reynolds_number")?`Re = ${escapeHtml(params.get("reynolds_number"))}`:"",
+      params.get("alpha_deg")?`alpha = ${escapeHtml(params.get("alpha_deg"))}`:"",
+      params.get("cl_min")?`CL >= ${escapeHtml(params.get("cl_min"))}`:"",
+      params.get("cl_max")?`CL <= ${escapeHtml(params.get("cl_max"))}`:"",
+      params.get("cd_min")?`CD >= ${escapeHtml(params.get("cd_min"))}`:"",
+      params.get("cd_max")?`CD <= ${escapeHtml(params.get("cd_max"))}`:"",
+      params.get("ld_min")?`CL/CD >= ${escapeHtml(params.get("ld_min"))}`:"",
       mode==="normal"?"is_anomaly = 0":mode==="only"?"is_anomaly = 1":"include anomalies"
     ].filter(Boolean).join(" · ")||"all conditions";
-    $("conditionSearchResult").innerHTML=`<div class="status">Condition search · ${conditionText} · Rows=${data.row_count} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows)}`;
+    $("conditionSearchResult").innerHTML=`<div class="status">Condition search · ${conditionText} · ${resultCountLabel(data)} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows)}`;
   }catch(e){
     $("conditionSearchResult").textContent=`Condition search failed: ${e.error||e.message||"unknown error"}`;
   }
 }
-function hideAdminReviewFilters(){
-  const box=$("adminReviewFilterBox");
-  if(box){box.classList.remove("visible");box.innerHTML="";}
-  state.adminReviewTable=null;
-}
-async function loadUsers(){try{hideAdminReviewFilters();$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/users"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
-async function loadLogs(){try{hideAdminReviewFilters();$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/query_logs"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
-async function loadAdminReviewFilters(table,requestId=state.adminReviewRequestId){
-  const box=$("adminReviewFilterBox");
-  if(!box)return false;
-  const target=$("adminAuditTargetSelect")?.value||"airfoils";
-  const previous={};
-  const presets=state.adminReviewPresetFilters||{};
-  document.querySelectorAll(".adminReviewPkFilter").forEach(input=>previous[input.dataset.pkColumn]=input.value);
-  document.querySelectorAll(".adminReviewExtraFilter").forEach(input=>previous[input.dataset.filterColumn]=input.value);
-  box.classList.add("visible");
-  box.innerHTML=`<div class="status">正在加载 ${escapeHtml(target)} 主键筛选项（包含逻辑删除记录）...</div>`;
-  const meta=await getJson(`/api/admin/main_table?table=${encodeURIComponent(target)}&limit=1&include_options=1&include_deleted=1`);
-  if(requestId!==state.adminReviewRequestId)return false;
-  const pkColumns=tablePrimaryKeyColumns(target);
-  const options=meta.filter_options||{};
-  const pkHtml=pkColumns.map(column=>{
-    const values=options[column]||[];
-    const current=String(presets[column]??previous[column]??"");
-    if(values.length){
-      return `<label class="keyFilter"><span>${escapeHtml(fieldLabel(column))}</span><select class="adminReviewPkFilter" data-pk-column="${escapeHtml(column)}"><option value="">全部</option>${values.map(value=>`<option value="${escapeHtml(value)}" ${current===String(value)?"selected":""}>${escapeHtml(value)}</option>`).join("")}</select></label>`;
-    }
-    return `<label class="keyFilter"><span>${escapeHtml(fieldLabel(column))}</span><input class="adminReviewPkFilter" data-pk-column="${escapeHtml(column)}" value="${escapeHtml(current)}" placeholder="输入 ${escapeHtml(column)} 检索"></label>`;
-  }).join("");
-  const hasRecordVersionFilters=["data_record_lineage","data_import_records","audit_logs"].includes(table);
-  const lineageHtml=hasRecordVersionFilters
-    ? ["previous_record_version_id","record_version_id"].map(column=>{
-        const current=String(presets[column]??previous[column]??"");
-        const hint=column==="previous_record_version_id" ? "旧值版本，如 1；初始/来源可填 null" : "新值版本，如 0 或 2";
-        return `<label class="keyFilter"><span>${escapeHtml(fieldLabel(column))}</span><input class="adminReviewExtraFilter" data-filter-column="${escapeHtml(column)}" value="${escapeHtml(current)}" placeholder="${escapeHtml(hint)}"></label>`;
-      }).join("")
-    : "";
-  const lineageHint=hasRecordVersionFilters
-    ? "；也可填写旧值记录版本和新值记录版本，查询某条记录的版本来源或修改过程"
-    : "";
-  const reviewMeaning={
-    data_import_records:"来源/版本写入记录：说明该记录由谁、通过系统/SQL/前端、从哪个来源写入。",
-    data_record_lineage:"记录修改追溯：说明该记录当前版本、上一版本、最后修改者和修改次数。",
-    audit_logs:"审计日志：记录 UPDATE/DELETE 等操作的修改前数据和修改后数据。",
-    soft_delete_records:"逻辑删除记录：保存被删除记录的完整快照，并支持恢复。"
-  }[table]||"管理员审查记录。";
-  box.innerHTML=pkHtml+lineageHtml+`<div class="status">${escapeHtml(reviewMeaning)}<br>按 ${escapeHtml(target)} 的主键检索当前审计表；不填主键则显示该关系的全部相关记录${lineageHint}。</div>`;
-  document.querySelectorAll(".adminReviewPkFilter,.adminReviewExtraFilter").forEach(input=>{
-    input.addEventListener("change",()=>openAdminReviewTable(table,{reloadFilters:false}));
-    if(input.tagName==="INPUT")input.addEventListener("keydown",event=>{if(event.key==="Enter")openAdminReviewTable(table,{reloadFilters:false});});
-  });
-  return true;
-}
-async function openAdminReviewTable(table,options={}){
-  const requestId=++state.adminReviewRequestId;
-  state.adminReviewLoading=true;
+async function loadUsers(){try{$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/users"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
+async function loadLogs(){try{$("adminResult").innerHTML=rowsToTable(await getJson("/api/admin/query_logs"));}catch(e){$("adminResult").textContent=e.message||String(e);}}
+async function openAdminReviewTable(table){
   try{
     showPage("admin");
-    state.adminReviewTable=table;
     const target=$("adminAuditTargetSelect")?.value||"airfoils";
     const params=new URLSearchParams({table,limit:"100"});
     if(table==="data_record_lineage"||table==="audit_logs"||table==="soft_delete_records"){
@@ -6728,37 +5179,13 @@ async function openAdminReviewTable(table,options={}){
     }else if(table==="data_import_records"){
       params.set("filter_target_table",target);
     }
-    if(options.reloadFilters!==false){
-      state.adminReviewPresetFilters=options.filters||{};
-      const filtersReady=await loadAdminReviewFilters(table,requestId);
-      if(!filtersReady||requestId!==state.adminReviewRequestId)return;
-    }
-    const pkValues={};
-    document.querySelectorAll(".adminReviewPkFilter").forEach(input=>{
-      pkValues[input.dataset.pkColumn]=input.value.trim();
-    });
-    const recordPk=buildRecordPkFromFilters(target,pkValues);
-    if(recordPk)params.set("filter_record_pk",recordPk);
-    if(["data_record_lineage","data_import_records","audit_logs"].includes(table)){
-      document.querySelectorAll(".adminReviewExtraFilter").forEach(input=>{
-        const value=input.value.trim();
-        if(value)params.set(`filter_${input.dataset.filterColumn}`,value);
-      });
-    }
-    if(options.reloadFilters!==false)state.adminReviewPresetFilters={};
     $("adminResult").textContent=`正在审查 ${table} / ${target}...`;
     const data=await getJson(`/api/admin/main_table?${params.toString()}`);
-    if(requestId!==state.adminReviewRequestId)return;
     const label=table==="users"||table==="query_logs" ? data.table : `${data.table} · target ${target}`;
-    const activeFilters=Object.entries(data.filters||{}).map(([k,v])=>`${escapeHtml(fieldLabel(k))} = "${escapeHtml(v)}"`).join(" · ")||"全部";
-    const resultHtml=data.rows.length?rowsToTable(data.rows,{table:data.table}):noRowsHint(data.table,target,data.filters||{});
-    $("adminResult").innerHTML=`<div class="status">Admin review: ${escapeHtml(label)} · showing ${data.rows.length} / ${data.total} rows · filters: ${activeFilters}</div>${resultHtml}`;
+    $("adminResult").innerHTML=`<div class="status">Admin review: ${escapeHtml(label)} · showing ${data.rows.length} / ${data.total} rows</div>${rowsToTable(data.rows,{table:data.table})}`;
     attachAdminResultActions();
   }catch(e){
-    if(requestId!==state.adminReviewRequestId)return;
     $("adminResult").textContent=e.error||e.message||String(e);
-  }finally{
-    if(requestId===state.adminReviewRequestId)state.adminReviewLoading=false;
   }
 }
 async function restoreSoftDeletedRecord(deleteId,table,recordPk){
@@ -6771,7 +5198,7 @@ async function restoreSoftDeletedRecord(deleteId,table,recordPk){
     state.airfoils=await getJson("/api/airfoils");
     renderAirfoilList();
     if(state.selectedAirfoil)loadVersionData().catch(err=>console.error(err));
-    await refreshMainDataAfterMutation({table,allTables:table==="airfoils"});
+    if($("pageGovernance").classList.contains("active"))loadMainTable().catch(err=>console.error(err));
     await openAdminReviewTable("soft_delete_records");
   }catch(e){
     $("adminResult").insertAdjacentHTML("afterbegin",`<div class="status danger">恢复失败：${escapeHtml(e.error||e.message||"unknown error")}</div>`);
@@ -6781,19 +5208,6 @@ function attachAdminResultActions(){
   document.querySelectorAll(".restoreDeleteBtn").forEach(btn=>{
     btn.addEventListener("click",()=>restoreSoftDeletedRecord(btn.dataset.deleteId,btn.dataset.table,btn.dataset.recordPk));
   });
-  document.querySelectorAll(".lineageToAuditBtn").forEach(btn=>{
-    btn.addEventListener("click",()=>{
-      const row=JSON.parse(btn.dataset.row||"{}");
-      const target=row.table_name||$("adminAuditTargetSelect")?.value||"airfoils";
-      const presets={record_pk:String(row.record_pk??"")};
-      const pkColumns=tablePrimaryKeyColumns(target);
-      if(pkColumns.length===1){
-        presets[pkColumns[0]]=String(row.record_pk??"");
-      }
-      $("adminAuditTargetSelect").value=target;
-      openAdminReviewTable("audit_logs",{filters:presets});
-    });
-  });
 }
 function syncMainTableOptions(){
   const blocked=new Set(["users","query_logs","audit_logs","data_record_lineage","data_import_records","soft_delete_records","performance_import_staging","saved_transactions"]);
@@ -6802,49 +5216,6 @@ function syncMainTableOptions(){
   });
   if($("adminTableSelect").selectedOptions[0]?.hidden){
     $("adminTableSelect").value="airfoils";
-  }
-}
-function invalidateMainTableFilters(table=null){
-  if(!state.mainFilterCache)state.mainFilterCache={};
-  if(table)delete state.mainFilterCache[table];
-  else state.mainFilterCache={};
-}
-async function refreshAdminReviewAfterMutation(table){
-  if(!isAdmin()||!state.adminReviewTable)return;
-  if(!$("pageAdmin")?.classList.contains("active"))return;
-  const target=$("adminAuditTargetSelect")?.value||"";
-  if(table&&target&&table!==target&&!["airfoils","data_versions","coordinate_points","performance_records","anomaly_records","data_sources"].includes(target))return;
-  const presets={};
-  document.querySelectorAll(".adminReviewPkFilter").forEach(input=>presets[input.dataset.pkColumn]=input.value);
-  document.querySelectorAll(".adminReviewExtraFilter").forEach(input=>presets[input.dataset.filterColumn]=input.value);
-  try{
-    await openAdminReviewTable(state.adminReviewTable,{filters:presets});
-  }catch(err){
-    console.error(err);
-  }
-}
-async function refreshMainDataAfterMutation(options={}){
-  const table=options.table||$("adminTableSelect")?.value||null;
-  invalidateMainTableFilters(table);
-  if(options.allTables)invalidateMainTableFilters();
-  if(options.reloadAirfoils!==false){
-    try{
-      state.airfoils=await getJson("/api/airfoils");
-      renderAirfoilList();
-    }catch(err){console.error(err);}
-  }
-  if($("pageGovernance")?.classList.contains("active")){
-    await loadMainTableFilters();
-    await loadMainTable();
-  }
-  if(options.refreshGovernance!==false){
-    await refreshCurrentGovernanceResult();
-  }
-  if(options.refreshAdminReview!==false){
-    await refreshAdminReviewAfterMutation(table);
-  }
-  if(state.selectedAirfoil&&options.reloadVersion!==false){
-    loadVersionData().catch(err=>console.error(err));
   }
 }
 async function loadMainTableFilters(){
@@ -6860,7 +5231,7 @@ async function loadMainTableFilters(){
     const options=data.filter_options||{};
     $("mainTableFilterBox").innerHTML=filterColumns.length?filterColumns.map(column=>{
       const values=options[column]||[];
-      return `<label class="keyFilter"><span>${escapeHtml(fieldLabel(column))}</span><select class="mainTableFilter" data-column="${escapeHtml(column)}"><option value="">全部</option>${values.map(value=>`<option value="${escapeHtml(value)}" ${String(previous[column]||"")===String(value)?"selected":""}>${escapeHtml(value)}</option>`).join("")}</select></label>`;
+      return `<label class="keyFilter"><span>${escapeHtml(column)}</span><select class="mainTableFilter" data-column="${escapeHtml(column)}"><option value="">全部</option>${values.map(value=>`<option value="${escapeHtml(value)}" ${String(previous[column]||"")===String(value)?"selected":""}>${escapeHtml(value)}</option>`).join("")}</select></label>`;
     }).join(""):`<div class="status">当前关系没有配置主键筛选项，默认显示全部记录。</div>`;
     document.querySelectorAll(".mainTableFilter").forEach(select=>select.addEventListener("change",loadMainTable));
     renderMainAddForm(false);
@@ -6887,29 +5258,27 @@ function renderMainAddForm(visible){
   $("toggleMainAddBtn").textContent=visible?"- 收起添加":"+ 添加记录";
   if(!visible)return;
   const sourceOptions=`<option value="uiuc_raw">uiuc_raw</option><option value="uiuc_raw_with_tracked_augmentation">uiuc_raw_with_tracked_augmentation</option><option value="generated_synthetic">generated_synthetic</option><option value="injected_anomaly">injected_anomaly</option>`;
-  const field=(name,placeholder="",value="")=>`<label class="keyFilter"><span>${escapeHtml(fieldLabel(name))}</span><input class="mainAddInput" data-field="${escapeHtml(name)}" placeholder="${escapeHtml(placeholder||name)}" value="${escapeHtml(value)}"></label>`;
-  const select=(name,options)=>`<label class="keyFilter"><span>${escapeHtml(fieldLabel(name))}</span><select class="mainAddInput" data-field="${escapeHtml(name)}">${options}</select></label>`;
+  const field=(name,placeholder="",value="")=>`<label class="keyFilter"><span>${escapeHtml(name)}</span><input class="mainAddInput" data-field="${escapeHtml(name)}" placeholder="${escapeHtml(placeholder||name)}" value="${escapeHtml(value)}"></label>`;
+  const select=(name,options)=>`<label class="keyFilter"><span>${escapeHtml(name)}</span><select class="mainAddInput" data-field="${escapeHtml(name)}">${options}</select></label>`;
   const airfoilOptions=(state.airfoils||[]).map(a=>`<option value="${escapeHtml(a.airfoil_id)}" ${a.airfoil_id===state.selectedAirfoil?"selected":""}>${escapeHtml(a.airfoil_id)} · ${escapeHtml(a.name||"")}</option>`).join("");
-  const newId=`frontend_${Date.now().toString(36).slice(-6)}`;
-  const selectedAirfoil=state.selectedAirfoil||(state.airfoils&&state.airfoils[0]?.airfoil_id)||"";
   let html="";
   if(table==="data_sources"){
     html=select("source_type",sourceOptions)+field("description","真实来源或生成规则说明");
   }else if(table==="airfoils"){
     html=[
-      field("airfoil_id","如 naca0012",newId),
+      field("airfoil_id","如 naca0012"),
       field("name","翼型名称"),
       field("source","UIUC / Frontend Input","Frontend Input"),
       field("family","系列","Manual"),
       select("source_type",sourceOptions),
-      field("source_file","来源文件",`frontend\\${newId}.dat`),
+      field("source_file","来源文件","frontend\\new_airfoil.dat"),
       field("original_point_count","原始点数","1"),
       field("final_point_count","最终点数","1"),
     ].join("");
   }else if(table==="data_versions"){
     html=[
       select("airfoil_id",airfoilOptions||`<option value="">请先加载 airfoils</option>`),
-      field("version_id","版本号","99"),
+      field("version_id","版本号","1"),
       select("version_type",`<option value="imported_raw">imported_raw</option><option value="augmented_from_raw">augmented_from_raw</option>`),
       select("coordinate_source_type",`<option value="real_only">real_only</option><option value="mixed_real_and_augmented">mixed_real_and_augmented</option>`),
       field("description","版本说明","Frontend created data version"),
@@ -6918,7 +5287,7 @@ function renderMainAddForm(visible){
     html=[
       select("airfoil_id",airfoilOptions||`<option value="">请先加载 airfoils</option>`),
       field("version_id","版本号","1"),
-      field("point_order","点序号","9999"),
+      field("point_order","点序号","1"),
       field("x","x 坐标","0.0"),
       field("y","y 坐标","0.0"),
       select("surface",`<option value="upper">upper</option><option value="lower">lower</option>`),
@@ -6933,19 +5302,6 @@ function renderMainAddForm(visible){
   $("submitMainAddBtn").addEventListener("click",submitMainAddForm);
 }
 function attachMainAddFieldBehaviors(table){
-  if(table==="airfoils"){
-    const idInput=document.querySelector('.mainAddInput[data-field="airfoil_id"]');
-    const sourceFile=document.querySelector('.mainAddInput[data-field="source_file"]');
-    if(idInput&&sourceFile){
-      const sync=()=>{
-        const id=idInput.value.trim().toLowerCase().replace(/[^a-z0-9_]/g,"_");
-        if(id)sourceFile.value=`frontend\\${id}.dat`;
-      };
-      idInput.addEventListener("input",sync);
-      sync();
-    }
-    return;
-  }
   if(table!=="coordinate_points")return;
   const pointSource=document.querySelector('.mainAddInput[data-field="point_source"]');
   const isAugmented=document.querySelector('.mainAddInput[data-field="is_augmented"]');
@@ -6983,16 +5339,22 @@ async function submitMainAddForm(){
     $("mainTableResult").textContent=`正在添加 ${table} 记录...`;
     const result=await postJson("/api/main_records/create",{table,data});
     $("mainTableResult").innerHTML=`<div class="status">Created ${escapeHtml(result.table)}.${escapeHtml(result.record_pk)} · Time=${result.elapsed_ms} ms</div>${rowsToTable(result.rows,{table:result.table})}`;
-    await refreshMainDataAfterMutation({table,allTables:table==="airfoils"});
+    state.mainFilterCache={};
+    await loadMainTableFilters();
+    await loadMainTable();
+    if(table==="airfoils"){
+      state.airfoils=await getJson("/api/airfoils");
+      renderAirfoilList();
+    }
   }catch(e){
     $("mainTableResult").textContent=`Create record failed: ${e.error||e.message||"unknown error"}`;
   }
 }
 function inlineField(name,label,value,type="text",readOnly=false){
-  return `<label>${escapeHtml(fieldLabel(label))}<input class="inlineEditInput" data-field="${escapeHtml(name)}" type="${escapeHtml(type)}" value="${escapeHtml(value??"")}" ${readOnly?"readonly":""}></label>`;
+  return `<label>${escapeHtml(label)}<input class="inlineEditInput" data-field="${escapeHtml(name)}" type="${escapeHtml(type)}" value="${escapeHtml(value??"")}" ${readOnly?"readonly":""}></label>`;
 }
 function inlineSelect(name,label,value,options){
-  return `<label>${escapeHtml(fieldLabel(label))}<select class="inlineEditInput" data-field="${escapeHtml(name)}">${options.map(opt=>`<option value="${escapeHtml(opt)}" ${String(value??"")===String(opt)?"selected":""}>${escapeHtml(opt)}</option>`).join("")}</select></label>`;
+  return `<label>${escapeHtml(label)}<select class="inlineEditInput" data-field="${escapeHtml(name)}">${options.map(opt=>`<option value="${escapeHtml(opt)}" ${String(value??"")===String(opt)?"selected":""}>${escapeHtml(opt)}</option>`).join("")}</select></label>`;
 }
 function renderInlineEditForm(table,row,colspan){
   const sourceTypes=["uiuc_raw","uiuc_raw_with_tracked_augmentation","generated_synthetic","injected_anomaly"];
@@ -7076,7 +5438,7 @@ async function submitInlineEdit(table,rowEl){
     }else if(state.selectedAirfoil){
       loadVersionData().catch(err=>console.error(err));
     }
-    setTimeout(()=>refreshMainDataAfterMutation({table,allTables:table==="airfoils"}).catch(err=>console.error(err)),350);
+    setTimeout(()=>loadMainTable().catch(err=>console.error(err)),350);
   }catch(e){
     status.textContent=`保存失败：${e.error||e.message||"unknown error"}`;
   }
@@ -7100,7 +5462,7 @@ async function softDeleteMainRecord(table,row){
     }else if(state.selectedAirfoil){
       loadVersionData().catch(err=>console.error(err));
     }
-    await refreshMainDataAfterMutation({table,allTables:table==="airfoils"});
+    await loadMainTable();
   }catch(e){
     $("mainTableResult").insertAdjacentHTML("afterbegin",`<div class="status danger">逻辑删除失败：${escapeHtml(e.error||e.message||"unknown error")}</div>`);
   }
@@ -7126,17 +5488,6 @@ function attachMainTableRowActions(){
       softDeleteMainRecord(table,row);
     });
   });
-  document.querySelectorAll(".rowAdminTraceBtn").forEach(button=>{
-    button.addEventListener("click",()=>{
-      const table=button.dataset.table;
-      const reviewTable=button.dataset.reviewTable||"audit_logs";
-      const row=JSON.parse(button.dataset.row||"{}");
-      const presets={};
-      tablePrimaryKeyColumns(table).forEach(column=>presets[column]=String(row[column]??""));
-      $("adminAuditTargetSelect").value=table;
-      openAdminReviewTable(reviewTable,{filters:presets});
-    });
-  });
 }
 async function loadMainTable(){
   try{
@@ -7158,7 +5509,7 @@ async function loadMainTable(){
   }
 }
 async function adminCreateUser(){try{const data=await postJson("/api/admin/users/create",{username:$("adminNewUsername").value.trim(),password:$("adminNewPassword").value,role:$("adminNewRole").value});$("adminResult").textContent=`Created user: ${data.username} (${data.role})`; $("adminNewPassword").value="";}catch(e){$("adminResult").textContent=`Create user failed: ${e.error||"unknown error"}`;}}
-async function createAirfoil(){try{const c=Number($("newAirfoilPoints").value||1);const id=$("newAirfoilId").value.trim();const data=await postJson("/api/airfoils/create",{airfoil_id:id,name:$("newAirfoilName").value.trim(),family:$("newAirfoilFamily").value.trim()||"Manual",original_point_count:c,final_point_count:c,source_file:`manual\\${id}.dat`});$("sqlResult").textContent=`Create ok: ${data.airfoil_id}`;await refreshMainDataAfterMutation({table:"airfoils",allTables:true});}catch(e){$("sqlResult").textContent=`Create failed: ${e.error||"unknown error"}`;}}
+async function createAirfoil(){try{const c=Number($("newAirfoilPoints").value||1);const id=$("newAirfoilId").value.trim();const data=await postJson("/api/airfoils/create",{airfoil_id:id,name:$("newAirfoilName").value.trim(),family:$("newAirfoilFamily").value.trim()||"Manual",original_point_count:c,final_point_count:c,source_file:`manual\\${id}.dat`});$("sqlResult").textContent=`Create ok: ${data.airfoil_id}`;state.airfoils=await getJson("/api/airfoils");renderAirfoilList();}catch(e){$("sqlResult").textContent=`Create failed: ${e.error||"unknown error"}`;}}
 async function updateAirfoilRecord(){
   try{
     $("governanceResult").textContent="正在更新 airfoils 记录...";
@@ -7176,7 +5527,8 @@ async function updateAirfoilRecord(){
     };
     const data=await postJson("/api/airfoils/update",payload);
     $("governanceResult").innerHTML=`<div class="status">Updated airfoil. Affected=${data.affected_rows} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows,{table:"airfoils"})}`;
-    refreshMainDataAfterMutation({table:"airfoils",allTables:true}).catch(err=>console.error(err));
+    getJson("/api/airfoils").then(rows=>{state.airfoils=rows;renderAirfoilList();}).catch(err=>console.error(err));
+    if($("adminTableSelect").value==="airfoils")loadMainTable().catch(err=>console.error(err));
     if(state.selectedAirfoil===payload.airfoil_id)selectAirfoil(payload.airfoil_id).catch(err=>console.error(err));
   }catch(e){
     $("governanceResult").textContent=`Update airfoil failed: ${e.error||"unknown error"}`;
@@ -7194,7 +5546,7 @@ async function updatePerformanceRecord(){
     };
     const data=await postJson("/api/performance_records/update",payload);
     $("governanceResult").innerHTML=`<div class="status">Updated performance record. Affected=${data.affected_rows} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows)}`;
-    refreshMainDataAfterMutation({table:"performance_records",reloadAirfoils:false}).catch(err=>console.error(err));
+    if($("adminTableSelect").value==="performance_records")loadMainTable().catch(err=>console.error(err));
     if(state.selectedAirfoil)loadVersionData().catch(err=>console.error(err));
   }catch(e){
     $("governanceResult").textContent=`Update performance failed: ${e.error||"unknown error"}`;
@@ -7213,7 +5565,7 @@ async function updateAnomalyRecord(){
     };
     const data=await postJson("/api/anomaly_records/update",payload);
     $("governanceResult").innerHTML=`<div class="status">Updated anomaly record. Affected=${data.affected_rows} · Time=${data.elapsed_ms} ms</div>${rowsToTable(data.rows,{table:"anomaly_records"})}`;
-    refreshMainDataAfterMutation({table:"anomaly_records",reloadAirfoils:false}).catch(err=>console.error(err));
+    if($("adminTableSelect").value==="anomaly_records")loadMainTable().catch(err=>console.error(err));
     if(state.selectedAirfoil)loadVersionData().catch(err=>console.error(err));
   }catch(e){
     $("governanceResult").textContent=`Update anomaly failed: ${e.error||"unknown error"}`;
@@ -7260,7 +5612,7 @@ function updateBatchHeaderHint(){
   const idNote=table==="performance_records"
     ?"<br><span class='status'>说明：perf_id 可作为文件内临时编号从 1 开始填写；导入时系统会自动重映射为数据库中的全局唯一主键，并在结果中显示映射表。异常数据表不支持直接批量导入，应由异常检测规则生成。</span>"
     :"";
-  $("batchExpectedHeader").innerHTML=`<b>目标关系：</b>${escapeHtml(table)}<br><b>期望表头：</b><code>${escapeHtml(header)}</code>${fieldGlossaryHtml(BATCH_HEADERS[table]||[])}<br><span class="status">请保证 CSV/TSV 第一行表头与上面完全一致，列名不能缺失、不能多出、不能乱序；数据行也要按同样顺序填写。</span>${idNote}`;
+  $("batchExpectedHeader").innerHTML=`<b>目标关系：</b>${escapeHtml(table)}<br><b>期望表头：</b><code>${escapeHtml(header)}</code><br><span class="status">请保证 CSV/TSV 第一行表头与上面完全一致，列名不能缺失、不能多出、不能乱序；数据行也要按同样顺序填写。</span>${idNote}`;
 }
 async function loadBatchFile(){
   const file=$("batchImportFile").files[0];
@@ -7327,7 +5679,9 @@ async function runBatchImport(){
     const pieces=[`<div class="status">Table=${escapeHtml(data.target_table||table)} · Batch=${escapeHtml(data.batch_id)} · Time=${data.elapsed_ms} ms</div>`];
     (data.sections||[]).forEach(section=>{pieces.push(`<h2>${escapeHtml(section.title)}</h2>${rowsToTable(section.rows||[])}`);});
     $("batchImportResult").innerHTML=pieces.join("");
-    await refreshMainDataAfterMutation({table,allTables:["airfoils","data_versions","coordinate_points"].includes(table)});
+    state.airfoils=await getJson("/api/airfoils");
+    renderAirfoilList();
+    if(state.selectedAirfoil)await loadVersionData();
   }catch(e){
     $("batchImportResult").textContent=`Batch import failed: ${e.error||e.message||"unknown error"}`;
   }
@@ -7345,38 +5699,18 @@ VALUES
 SELECT perf_id, airfoil_id, alpha_deg, reynolds_number, cl, cd
 FROM performance_records
 WHERE perf_id IN (9000001, 9000002);`;$("transactionResult").textContent="场景2已填入：建议点击“执行并提交”，第二条 INSERT 会违反 alpha_deg CHECK，整批回滚。";}
-function loadVersionAtomicScenario(){$("transactionSqlInput").value=`DELETE FROM data_versions
-WHERE airfoil_id IN ('txn3_src', 'txn3_dst');
+function loadVersionAtomicScenario(){$("transactionSqlInput").value=`UPDATE airfoils
+SET airfoil_id = 'ag03_txn'
+WHERE airfoil_id = 'ag03';
 
-DELETE FROM airfoils
-WHERE airfoil_id IN ('txn3_src', 'txn3_dst');
+UPDATE data_versions
+SET version_type = 'bad_version_type'
+WHERE airfoil_id = 'ag03_txn' AND version_id = 1;
 
-INSERT INTO airfoils
-    (airfoil_id, name, source, family, is_generated, source_type, source_file,
-     has_augmented_coordinates, original_point_count, final_point_count)
-VALUES
-    ('txn3_src', 'TXN Cascade Source', 'Transaction Experiment', 'Txn Cascade',
-     1, 'generated_synthetic', 'txn/txn3_src.dat', 0, 1, 1);
-
-INSERT INTO data_versions
-    (airfoil_id, version_id, version_type, coordinate_source_type, description)
-VALUES
-    ('txn3_src', 1, 'imported_raw', 'real_only',
-     'version row used to verify ON UPDATE CASCADE');
-
-UPDATE airfoils
-SET airfoil_id = 'txn3_dst'
-WHERE airfoil_id = 'txn3_src';
-
-SELECT a.airfoil_id AS airfoil_pk,
-       v.airfoil_id AS version_fk,
-       v.version_id,
-       v.version_type,
-       v.description
+SELECT a.airfoil_id AS airfoil_pk, v.airfoil_id AS version_fk, v.version_id, v.version_type
 FROM airfoils a
 JOIN data_versions v ON v.airfoil_id = a.airfoil_id
-WHERE a.airfoil_id IN ('txn3_src', 'txn3_dst')
-ORDER BY a.airfoil_id, v.version_id;`;$("transactionResult").textContent="场景3已填入：这里只手动 UPDATE 主表 airfoils.airfoil_id，data_versions.airfoil_id 依靠外键 ON UPDATE CASCADE 自动同步。点击“执行并回滚”可证明主表和版本表一同失败；点击“执行并提交”可证明二者一同成功。";}
+WHERE a.airfoil_id IN ('ag03', 'ag03_txn') AND v.version_id = 1;`;$("transactionResult").textContent="场景3已填入：建议点击“执行并提交”。第一条 UPDATE 修改 airfoils.airfoil_id，并通过 ON UPDATE CASCADE 级联到版本表；第二条 UPDATE 违反 version_type CHECK，因此整个事务回滚。";}
 function renderSavedTransactions(){
   const select=$("savedTransactionSelect");
   select.innerHTML=state.savedTransactions.map(r=>`<option value="${r.saved_id}">${escapeHtml(r.title)}</option>`).join("")||`<option value="">No saved transactions</option>`;
@@ -7423,144 +5757,23 @@ async function deleteSelectedSavedTransaction(){
     $("transactionResult").textContent=`Delete transaction failed: ${e.error||"unknown error"}`;
   }
 }
-function renderTransactionQueue(){
-  const box=$("transactionQueueList");
-  if(!box)return;
-  if(!state.transactionQueue.length){
-    box.textContent="事务列表为空。先保存事务，再从下拉框加入列表。";
-    return;
-  }
-  box.innerHTML=state.transactionQueue.map((item,index)=>`
-    <div class="queueItem">
-      <span class="badge">${index+1}</span>
-      <strong>${escapeHtml(item.title)}</strong>
-      <button class="action queueMoveBtn" data-index="${index}" data-dir="-1" title="上移">↑</button>
-      <button class="action queueMoveBtn" data-index="${index}" data-dir="1" title="下移">↓</button>
-      <button class="action rowDeleteBtn queueRemoveBtn" data-index="${index}" title="移除">×</button>
-      <div class="status" style="grid-column:2 / -1">${escapeHtml(String(item.sql_text||"").split(/\s+/).slice(0,18).join(" "))}</div>
-    </div>
-  `).join("");
-  document.querySelectorAll(".queueMoveBtn").forEach(btn=>btn.addEventListener("click",()=>{
-    const index=Number(btn.dataset.index),dir=Number(btn.dataset.dir),next=index+dir;
-    if(next<0||next>=state.transactionQueue.length)return;
-    const copy=[...state.transactionQueue];
-    [copy[index],copy[next]]=[copy[next],copy[index]];
-    state.transactionQueue=copy;
-    renderTransactionQueue();
-  }));
-  document.querySelectorAll(".queueRemoveBtn").forEach(btn=>btn.addEventListener("click",()=>{
-    const index=Number(btn.dataset.index);
-    state.transactionQueue=state.transactionQueue.filter((_,i)=>i!==index);
-    renderTransactionQueue();
-  }));
-}
-function addSelectedTransactionToQueue(){
-  const id=Number($("savedTransactionSelect").value||0);
-  const item=state.savedTransactions.find(r=>Number(r.saved_id)===id);
-  if(!item){$("transactionResult").textContent="No saved transaction selected.";return;}
-  state.transactionQueue.push(item);
-  renderTransactionQueue();
-  $("transactionResult").textContent=`Added to transaction list: ${item.title}`;
-}
-function clearTransactionQueue(){
-  state.transactionQueue=[];
-  renderTransactionQueue();
-  $("transactionResult").textContent="Transaction list cleared.";
-}
-function transactionTimelineChart(data){
-  const events=(data.timeline||[]).map(e=>({...e,at_ms:Number(e.at_ms||0),elapsed_ms:e.elapsed_ms==null?0:Number(e.elapsed_ms||0)}));
-  if(!events.length)return `<div class="status">No timeline events.</div>`;
-  const total=Math.max(Number(data.elapsed_ms||0),...events.map(e=>e.at_ms+Math.max(e.elapsed_ms,0.1)),1);
-  const lanes=[...new Map(events.map(e=>[`${e.queue_step}:${e.transaction}`,{queue_step:e.queue_step,transaction:e.transaction}])).values()];
-  const svgW=1040, left=160, right=28, top=34, laneH=48, plotW=svgW-left-right;
-  const svgH=top+lanes.length*laneH+42;
-  const x=ms=>left+(Math.max(0,Math.min(total,ms))/total)*plotW;
-  const ticks=[0,total/4,total/2,total*3/4,total];
-  const grid=ticks.map(t=>`<line class="gridLine" x1="${x(t)}" y1="20" x2="${x(t)}" y2="${svgH-24}"></line><text x="${x(t)}" y="16" text-anchor="${t===0?"start":t===total?"end":"middle"}">${num(t,2)} ms</text>`).join("");
-  const lanesHtml=lanes.map((lane,laneIndex)=>{
-    const cy=top+laneIndex*laneH+26;
-    const laneEvents=events.filter(e=>e.queue_step===lane.queue_step&&e.transaction===lane.transaction);
-    const start=Math.min(...laneEvents.map(e=>e.at_ms));
-    const end=Math.max(...laneEvents.map(e=>e.at_ms+Math.max(e.elapsed_ms,0)));
-    const startX=x(start);
-    const barW=Math.max(8,x(end)-startX);
-    const title=`${lane.transaction} · start ${num(start,3)} ms · end ${num(end,3)} ms · duration ${num(end-start,3)} ms`;
-    return `<g><text class="laneLabel" x="12" y="${cy+4}">T${lane.queue_step}: ${escapeHtml(lane.transaction)}</text><line class="axis" x1="${left}" y1="${cy}" x2="${svgW-right}" y2="${cy}"></line><g><title>${escapeHtml(title)}</title><rect class="txnDurationBar" x="${startX}" y="${cy-9}" width="${barW}" height="18" rx="9"></rect></g></g>`;
-  }).join("");
-  return `<div class="txnChartWrap"><svg class="txnSvg" viewBox="0 0 ${svgW} ${svgH}" role="img" aria-label="Transaction duration timeline">${grid}${lanesHtml}</svg></div>`;
-}
-function renderTransactionTimeline(data){
-  const pieces=[
-    `<div class="status">Queue status=${escapeHtml(data.status)} · Mode=${escapeHtml(data.mode)} · Transactions=${data.queue_count} · Time=${data.elapsed_ms} ms</div>`,
-    `<h2>Timeline Chart</h2>`,
-    transactionTimelineChart(data),
-    `<h2>Timeline Events</h2>`,
-    rowsToTable(data.timeline||[])
-  ];
-  (data.transactions||[]).forEach(tx=>{
-    pieces.push(`<h2>Transaction ${tx.queue_step}: ${escapeHtml(tx.title)} · ${escapeHtml(tx.status)} · ${tx.elapsed_ms} ms</h2>`);
-    if(tx.error)pieces.push(`<div class="status danger">Error: ${escapeHtml(tx.error)}</div>`);
-    (tx.results||[]).forEach(r=>{
-      pieces.push(`<div class="status">Step ${r.step} · ${escapeHtml(r.type)} · ${r.elapsed_ms} ms · ${escapeHtml(r.sql)}</div>`);
-      if(r.rows&&r.rows.length){pieces.push(rowsToTable(r.rows));}
-      else{pieces.push(`<div class="status">Affected rows: ${r.affected_rows??0}</div>`);}
-    });
-  });
-  $("transactionResult").innerHTML=pieces.join("");
-}
-async function runTransactionQueue(mode){
-  try{
-    if(!state.transactionQueue.length){$("transactionResult").textContent="Transaction list is empty.";return;}
-    $("transactionResult").textContent="Transaction queue running...";
-    const d=await postJson("/api/transaction_experiment/run_queue",{mode,saved_ids:state.transactionQueue.map(x=>x.saved_id)});
-    renderTransactionTimeline(d);
-    if(mode==="commit"){
-      await refreshMainDataAfterMutation({allTables:true});
-    }
-  }catch(e){
-    if(e.timeline||e.transactions){renderTransactionTimeline(e);}
-    else{$("transactionResult").textContent=`Transaction queue failed: ${e.error||"unknown error"}`;}
-  }
-}
 async function runConcurrencyScenario(){try{$("transactionResult").textContent="并发实验运行中：User A 持有行锁约 2 秒，User B 会等待...";const d=await postJson("/api/transaction_experiment/concurrency",{perf_id:9100001});const pieces=[`<div class="status">Status=${d.status} · perf_id=${d.perf_id} · Time=${d.elapsed_ms} ms</div><h2>Timeline</h2>${rowsToTable(d.steps)}`];if(d.errors&&d.errors.length){pieces.push(`<h2>Errors</h2>${rowsToTable(d.errors.map(x=>({error:x})))}`);}pieces.push(`<h2>Final Record</h2>${rowsToTable(d.final_rows)}`);$("transactionResult").innerHTML=pieces.join("");}catch(e){$("transactionResult").textContent=`Concurrency experiment failed: ${e.error||"unknown error"}`;}}
 async function runTransaction(mode){try{const d=await postJson("/api/transaction_experiment/run",{sql:$("transactionSqlInput").value,mode});const pieces=[`<div class="status">Status=${d.status} · Statements=${d.statement_count} · Time=${d.elapsed_ms} ms</div>`];d.results.forEach(r=>{pieces.push(`<h2>Step ${r.step} · ${escapeHtml(r.type)} · ${r.elapsed_ms} ms</h2><div class="status">${escapeHtml(r.sql)}</div>`);if(r.rows&&r.rows.length){pieces.push(rowsToTable(r.rows));}else{pieces.push(`<div class="status">Affected rows: ${r.affected_rows??0}</div>`);}});$("transactionResult").innerHTML=pieces.join("");if(mode==="commit"){state.airfoils=await getJson("/api/airfoils");renderAirfoilList();if(state.selectedAirfoil)selectAirfoil(state.selectedAirfoil);}}catch(e){const partial=e.results&&e.results.length?`<h2>Partial Results</h2>${e.results.map(r=>`<div class="status">Step ${r.step}: ${escapeHtml(r.type)} · affected ${r.affected_rows??0}</div>`).join("")}`:"";$("transactionResult").innerHTML=`Transaction failed: ${escapeHtml(e.error||"unknown error")}<br>Status: ${escapeHtml(e.status||"rolled back")}${partial}`;}}
-async function runTransaction(mode){
-  try{
-    const d=await postJson("/api/transaction_experiment/run",{sql:$("transactionSqlInput").value,mode});
-    const pieces=[`<div class="status">Status=${d.status} · Statements=${d.statement_count} · Time=${d.elapsed_ms} ms</div>`];
-    d.results.forEach(r=>{
-      pieces.push(`<h2>Step ${r.step} · ${escapeHtml(r.type)} · ${r.elapsed_ms} ms</h2><div class="status">${escapeHtml(r.sql)}</div>`);
-      if(r.rows&&r.rows.length){pieces.push(rowsToTable(r.rows));}
-      else{pieces.push(`<div class="status">Affected rows: ${r.affected_rows??0}</div>`);}
-    });
-    $("transactionResult").innerHTML=pieces.join("");
-    if(mode==="commit")await refreshMainDataAfterMutation({allTables:true});
-  }catch(e){
-    const partial=e.results&&e.results.length?`<h2>Partial Results</h2>${e.results.map(r=>`<div class="status">Step ${r.step}: ${escapeHtml(r.type)} · affected ${r.affected_rows??0}</div>`).join("")}`:"";
-    $("transactionResult").innerHTML=`Transaction failed: ${escapeHtml(e.error||"unknown error")}<br>Status: ${escapeHtml(e.status||"rolled back")}${partial}`;
-  }
-}
 async function runDbObjectExperiment(scenario){
   try{
     $("dbObjectResult").textContent="Running database object experiment...";
     document.querySelectorAll(".dbObjectBtn").forEach(b=>b.classList.toggle("primary",b.dataset.scenario===scenario));
     const d=await postJson("/api/db_object_experiment/run",{scenario});
-    const dbObjectDefinitionHtml=(d.definition_blocks&&d.definition_blocks.length)
-      ? `<h2>对象定义 SQL</h2><div class="status">下面展示本场景依赖的视图、触发器或存储过程定义。点击标题可展开查看代码。</div>${d.definition_blocks.map((block,index)=>`<details class="sqlBlock"><summary>对象 ${index+1}：${escapeHtml(block.title||"")}</summary>${sqlPre(block.sql||"")}</details>`).join("")}`
-      : "";
-    const dbObjectSqlBlocksHtml=(d.sql_blocks&&d.sql_blocks.length)
-      ? `<h2>实验执行 SQL</h2>${d.sql_blocks.map((block,index)=>`<details class="sqlBlock" open><summary>SQL ${index+1}：${escapeHtml(block.title||"")}</summary>${sqlPre(block.sql||"")}</details>`).join("")}`
-      : "";
     const pieces=[`<div class="status">Scenario=${escapeHtml(d.scenario)} · Time=${d.elapsed_ms} ms</div>`];
     (d.sections||[]).forEach(section=>{
       pieces.push(`<h2>${escapeHtml(section.title)}</h2>`);
       if(section.note){pieces.push(`<div class="status">${escapeHtml(section.note)}</div>`);}
       pieces.push(rowsToTable(section.rows||[]));
     });
-    if(dbObjectSqlBlocksHtml)pieces.splice(1,0,dbObjectSqlBlocksHtml);
-    if(dbObjectDefinitionHtml)pieces.splice(1,0,dbObjectDefinitionHtml);
     $("dbObjectResult").innerHTML=pieces.join("");
-    await refreshMainDataAfterMutation({allTables:true,refreshAdminReview:false});
+    state.airfoils=await getJson("/api/airfoils");
+    renderAirfoilList();
+    if(state.selectedAirfoil)selectAirfoil(state.selectedAirfoil);
   }catch(e){
     $("dbObjectResult").textContent=`Experiment failed: ${e.error||"unknown error"}`;
   }
@@ -7573,11 +5786,7 @@ async function selectAirfoil(id){
   state.versions=data.versions||[];
   const a=data.airfoil;
   $("airfoilTitle").textContent=`${a.airfoil_id} · ${a.name}`;
-  $("airfoilMeta").innerHTML=[
-    `<span><b>数据来源类型：</b>${escapeHtml(a.source_type||"-")}</span>`,
-    `<span><b>源文件路径：</b>${escapeHtml(a.source_file||"-")}</span>`,
-    `<span><b>坐标点数量：</b>原始 ${escapeHtml(a.original_point_count)}，最终 ${escapeHtml(a.final_point_count)}</span>`
-  ].join("<br>");
+  $("airfoilMeta").textContent=`${a.source_type} · ${a.source_file} · original ${a.original_point_count}, final ${a.final_point_count}`;
   $("versionSelect").innerHTML=state.versions.map(v=>`<option value="${v.version_id}">version ${v.version_id} · ${v.version_type}</option>`).join("");
   if(!state.versions.length){
     state.coordinates=[];
@@ -7586,14 +5795,14 @@ async function selectAirfoil(id){
     $("coordStatus").textContent="0 points";
     $("perfStatus").textContent="0 records";
     $("anomalyStatus").textContent="0 anomalies";
-    drawShape();drawPerformance();drawCd();drawLd();drawCoordPie();
+    drawShape();drawPerformance();drawCd();drawLd();
     return;
   }
   state.selectedVersion=Number(state.versions[0].version_id);
   await loadVersionData();
 }
 function syncReSelects(values){
-  const options=values.map(re=>`<option value="${re}">Re ${re.toLocaleString()}（雷诺数）</option>`).join("");
+  const options=values.map(re=>`<option value="${re}">Re ${re.toLocaleString()}</option>`).join("");
   ["reSelect","cdReSelect","ldReSelect"].forEach(id=>{
     $(id).innerHTML=options;
     $(id).value=String(state.selectedRe);
@@ -7622,13 +5831,10 @@ async function loadVersionData(){
     const res=[...new Set(perf.map(r=>Number(r.reynolds_number)))].sort((a,b)=>a-b);
     state.selectedRe=res.includes(state.selectedRe)?state.selectedRe:(res[0]||50000);
     syncReSelects(res);
-    const upperCount=coords.filter(r=>r.surface==="upper").length;
-    const lowerCount=coords.filter(r=>r.surface==="lower").length;
-    const augCount=coords.filter(r=>Number(r.is_augmented)===1||r.point_source==="augmented").length;
-    $("coordStatus").textContent=`${coords.length} points · upper ${upperCount} / lower ${lowerCount} · augmented ${augCount} · anomalies ${anom.length}`;
+    $("coordStatus").textContent=`${coords.length} points`;
     $("perfStatus").textContent=`${perf.length} records`;
     $("anomalyStatus").textContent=`${anom.length} anomalies`;
-    renderMetrics();renderAnomalies();drawShape();drawPerformance();drawCd();drawLd();drawCoordPie();scheduleSecondaryCharts();
+    renderMetrics();renderAnomalies();drawShape();drawPerformance();drawCd();drawLd();scheduleSecondaryCharts();
   }catch(e){
     state.coordinates=[];
     state.performance=[];
@@ -7636,12 +5842,12 @@ async function loadVersionData(){
     $("coordStatus").textContent="load failed";
     $("perfStatus").textContent="load failed";
     $("anomalyStatus").textContent="load failed";
-    drawShape();drawPerformance();drawCd();drawLd();drawCoordPie();
+    drawShape();drawPerformance();drawCd();drawLd();
     console.error(e);
     alert(`翼型详情加载失败：${e.error||e.message||"unknown error"}`);
   }
 }
-function renderMetrics(){const cls=state.performance.map(r=>Number(r.cl));const cds=state.performance.map(r=>Number(r.cd));const ac=state.performance.filter(r=>Number(r.is_anomaly)===1).length;$("metrics").innerHTML=`<div class="metric"><b>${state.coordinates.length}</b><span>坐标点</span></div><div class="metric"><b>${num(Math.max(...cls),3)}</b><span>最大 CL（升力系数）</span></div><div class="metric"><b>${num(Math.min(...cds),5)}</b><span>最小 CD（阻力系数）</span></div><div class="metric"><b>${state.performance.length}</b><span>性能记录</span></div><div class="metric"><b>${ac}</b><span>异常标记</span></div><div class="metric"><b>${state.selectedVersion}</b><span>局部版本号</span></div>`;}
+function renderMetrics(){const cls=state.performance.map(r=>Number(r.cl));const cds=state.performance.map(r=>Number(r.cd));const ac=state.performance.filter(r=>Number(r.is_anomaly)===1).length;$("metrics").innerHTML=`<div class="metric"><b>${state.coordinates.length}</b><span>坐标点</span></div><div class="metric"><b>${num(Math.max(...cls),3)}</b><span>最大 CL</span></div><div class="metric"><b>${num(Math.min(...cds),5)}</b><span>最小 CD</span></div><div class="metric"><b>${state.performance.length}</b><span>性能记录</span></div><div class="metric"><b>${ac}</b><span>异常标记</span></div><div class="metric"><b>${state.selectedVersion}</b><span>局部版本号</span></div>`;}
 function renderAnomalies(){const body=$("anomalyRows");body.innerHTML=state.anomalies.map(r=>`<tr><td>${r.anomaly_id}</td><td class="danger">${r.rule_type}</td><td>${r.alpha_deg}</td><td>${Number(r.reynolds_number).toLocaleString()}</td><td>${num(r.cl,3)}</td><td>${num(r.cd,5)}</td></tr>`).join("")||`<tr><td colspan="6">当前翼型版本没有异常记录</td></tr>`;}
 async function refreshIndexStatus(){const d=await getJson("/api/index_experiment/status");$("indexStatus").textContent=d.exists?"idx exists":"idx missing";}
 async function loadIndexTables(){const tables=await getJson("/api/index_experiment/tables");$("indexTableSelect").innerHTML=tables.map(t=>`<option value="${t}" ${t==="performance_records"?"selected":""}>${t}</option>`).join("");await loadIndexColumns();}
@@ -7668,7 +5874,7 @@ function showIndexForm(mode){
 async function loadIndexes(){try{const table=$("indexTableSelect").value||"performance_records";const rows=await getJson(`/api/index_experiment/indexes?table=${encodeURIComponent(table)}`);$("indexList").innerHTML=renderIndexTable(rows);attachIndexRowDeleteActions();}catch(e){$("indexList").textContent=e.message||String(e);}}
 async function createIndex(){try{const payload={table:$("indexTableSelect").value,index_name:$("indexNameInput").value.trim(),columns:selectedIndexColumns()};const data=await postJson("/api/index_experiment/create",payload);await refreshIndexStatus();await loadIndexes();$("indexList").insertAdjacentHTML("afterbegin",`<div class="status">Created ${escapeHtml(data.index_name)} on ${escapeHtml(data.table)}(${data.columns.map(escapeHtml).join(", ")}).</div>`);}catch(e){$("indexList").textContent=e.error||"create failed";}}
 async function dropIndex(indexName){try{const table=$("indexTableSelect").value;if(!indexName)return;if(!confirm(`删除 ${table}.${indexName} ?`))return;const data=await postJson("/api/index_experiment/drop",{table,index_name:indexName});await refreshIndexStatus();await loadIndexes();$("indexList").insertAdjacentHTML("afterbegin",`<div class="status">Dropped ${escapeHtml(data.index_name)} on ${escapeHtml(data.table)}.</div>`);}catch(e){$("indexList").textContent=e.error||"drop failed";}}
-async function runIndex(){try{const d=await postJson("/api/index_experiment/run_sql",{sql:$("indexSqlInput").value});$("indexResult").innerHTML=`<div class="status">Rows=${d.row_count} · Time=${d.elapsed_ms} ms · showing first ${d.rows.length}</div><h2>Result</h2>${rowsToTable(d.rows)}<h2>EXPLAIN</h2>${rowsToTable(d.explain)}`;}catch(e){$("indexResult").textContent=`Experiment failed: ${e.error||"unknown error"}`;}}
+async function runIndex(){try{const d=await postJson("/api/index_experiment/run_sql",{sql:$("indexSqlInput").value});$("indexResult").innerHTML=`<div class="status">${resultCountLabel(d)} · Time=${d.elapsed_ms} ms</div><h2>Result</h2>${rowsToTable(d.rows)}<h2>EXPLAIN</h2>${rowsToTable(d.explain)}`;}catch(e){$("indexResult").textContent=`Experiment failed: ${e.error||"unknown error"}`;}}
 function setupCanvas(canvas){const rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;canvas.width=Math.max(1,Math.floor(rect.width*dpr));canvas.height=Math.max(1,Math.floor(rect.height*dpr));const ctx=canvas.getContext("2d");ctx.setTransform(dpr,0,0,dpr,0,0);return{ctx,width:rect.width,height:rect.height};}
 function axisFmt(value){
   const n=Number(value);
@@ -7709,112 +5915,23 @@ function drawAxes(ctx,w,h,xMin=null,xMax=null,yMin=null,yMax=null){
   return{left,right,top,bottom,plotW,plotH};
 }
 function nearestPoint(points,x,y,maxDist=28){let best=null,bestD=maxDist*maxDist;points.forEach(p=>{const d=(p.sx-x)**2+(p.sy-y)**2;if(d<bestD){best=p;bestD=d;}});return best;}
-function showTooltip(id,canvas,x,y,html){
-  const tip=$(id),section=canvas.closest("section"),srect=section.getBoundingClientRect();
-  tip.innerHTML=html;
-  tip.style.display="block";
-  const margin=10;
-  let left=canvas.offsetLeft+x+16;
-  let top=canvas.offsetTop+y+16;
-  if(id==="shapeTooltip"){
-    left=canvas.offsetLeft+x+18;
-    top=canvas.offsetTop+y-tip.offsetHeight-18;
-  }
-  if(left+tip.offsetWidth>srect.width-margin)left=canvas.offsetLeft+x-tip.offsetWidth-18;
-  if(top+tip.offsetHeight>srect.height-margin)top=srect.height-tip.offsetHeight-margin;
-  if(top<margin)top=canvas.offsetTop+margin;
-  if(left<margin)left=margin;
-  tip.style.left=`${left}px`;
-  tip.style.top=`${top}px`;
-}
+function showTooltip(id,canvas,x,y,html){const tip=$(id),section=canvas.closest("section"),srect=section.getBoundingClientRect();tip.innerHTML=html;tip.style.display="block";let left=canvas.offsetLeft+x+14,top=canvas.offsetTop+y+14;if(left+tip.offsetWidth>srect.width)left=canvas.offsetLeft+x-tip.offsetWidth-14;if(top+tip.offsetHeight>srect.height)top=canvas.offsetTop+y-tip.offsetHeight-14;tip.style.left=`${Math.max(8,left)}px`;tip.style.top=`${Math.max(8,top)}px`;}
 function hideTooltip(id){$(id).style.display="none";}
-function handleShapeHover(e){const canvas=$("shapeCanvas"),rect=canvas.getBoundingClientRect(),p=nearestPoint(state.shapeScreen,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip("shapeTooltip");return;}const augmented=Number(p.is_augmented)===1||p.point_source==="augmented";const hasAnomaly=state.anomalies&&state.anomalies.length>0;showTooltip("shapeTooltip",canvas,p.sx,p.sy,`point_order: ${p.point_order}<br>x: ${num(p.x,5)}<br>y: ${num(p.y,5)}<br>surface（正/反面）: ${escapeHtml(p.surface)}<br>source: ${escapeHtml(p.point_source)}<br>is_augmented（增强点）: ${augmented?"yes":"no"}<br>method: ${escapeHtml(p.augmentation_method||"-")}${hasAnomaly?"<br><span class='danger'>当前翼型版本存在异常性能记录</span>":""}`);}
-function handlePerfHover(e){const canvas=$("perfCanvas"),rect=canvas.getBoundingClientRect(),p=nearestPoint(state.perfScreen,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip("perfTooltip");return;}showTooltip("perfTooltip",canvas,p.sx,p.sy,`alpha（攻角）: ${num(p.alpha_deg,2)} deg<br>Re（雷诺数）: ${Number(p.reynolds_number).toLocaleString()}<br>CL（升力系数）: ${num(p.cl,4)}<br>CD（阻力系数）: ${num(p.cd,5)}<br>CM（力矩系数）: ${num(p.cm,4)}${Number(p.is_anomaly)===1?"<br>anomaly: yes":""}`);}
-function handleSeriesHover(e,canvasId,tipId,points){const canvas=$(canvasId),rect=canvas.getBoundingClientRect(),p=nearestPoint(points,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip(tipId);return;}showTooltip(tipId,canvas,p.sx,p.sy,`${escapeHtml(p.label||"point")}<br>alpha（攻角）: ${num(p.alpha_deg,2)} deg<br>value（指标值）: ${num(p.value,5)}<br>Re（雷诺数）: ${Number(p.reynolds_number).toLocaleString()}`);}
-function handleCompareHover(e){const canvas=$("compareCanvas"),scroll=$("compareScroll"),rect=canvas.getBoundingClientRect(),x=e.clientX-rect.left,y=e.clientY-rect.top;const p=state.compareScreen.find(b=>x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h);if(!p){hideTooltip("compareTooltip");return;}const visibleY=p.y-(scroll?scroll.scrollTop:0);showTooltip("compareTooltip",canvas,p.x+p.w/2,visibleY,`${escapeHtml(p.airfoil_id)}<br>${escapeHtml(p.name)}<br>${metricLabel(state.compareMetric)}: ${num(p.value,5)}`);}
-function handleVersionDiffHover(e){const canvas=$("versionDiffCanvas"),scroll=$("versionDiffScroll"),rect=canvas.getBoundingClientRect(),x=e.clientX-rect.left,y=e.clientY-rect.top;const p=state.versionDiffScreen.find(b=>x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h);if(!p){hideTooltip("versionDiffTooltip");return;}const visibleY=p.y-(scroll?scroll.scrollTop:0);showTooltip("versionDiffTooltip",canvas,p.x+p.w/2,visibleY,`${escapeHtml(p.label||"version")}<br>${escapeHtml(p.name||"")}<br>${escapeHtml(p.version_type||"")}<br>最大 CL/CD（升阻比）: ${num(p.value,5)}`);}
+function handleShapeHover(e){const canvas=$("shapeCanvas"),rect=canvas.getBoundingClientRect(),p=nearestPoint(state.shapeScreen,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip("shapeTooltip");return;}showTooltip("shapeTooltip",canvas,p.sx,p.sy,`point_order: ${p.point_order}<br>x: ${num(p.x,5)}<br>y: ${num(p.y,5)}<br>surface: ${escapeHtml(p.surface)}<br>source: ${escapeHtml(p.point_source)}`);}
+function handlePerfHover(e){const canvas=$("perfCanvas"),rect=canvas.getBoundingClientRect(),p=nearestPoint(state.perfScreen,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip("perfTooltip");return;}showTooltip("perfTooltip",canvas,p.sx,p.sy,`alpha: ${num(p.alpha_deg,2)} deg<br>Re: ${Number(p.reynolds_number).toLocaleString()}<br>CL: ${num(p.cl,4)}<br>CD: ${num(p.cd,5)}<br>CM: ${num(p.cm,4)}${Number(p.is_anomaly)===1?"<br>anomaly: yes":""}`);}
+function handleSeriesHover(e,canvasId,tipId,points){const canvas=$(canvasId),rect=canvas.getBoundingClientRect(),p=nearestPoint(points,e.clientX-rect.left,e.clientY-rect.top);if(!p){hideTooltip(tipId);return;}showTooltip(tipId,canvas,p.sx,p.sy,`${escapeHtml(p.label||"point")}<br>alpha: ${num(p.alpha_deg,2)} deg<br>value: ${num(p.value,5)}<br>Re: ${Number(p.reynolds_number).toLocaleString()}`);}
+function handleCompareHover(e){const canvas=$("compareCanvas"),rect=canvas.getBoundingClientRect(),x=e.clientX-rect.left,y=e.clientY-rect.top;const p=state.compareScreen.find(b=>x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h);if(!p){hideTooltip("compareTooltip");return;}showTooltip("compareTooltip",canvas,p.x+p.w/2,p.y,`${escapeHtml(p.airfoil_id)}<br>${escapeHtml(p.name)}<br>${escapeHtml(state.compareMetric)}: ${num(p.value,5)}`);}
 function drawLineSeries(canvasId,rows,valueFn,screenKey,label){const {ctx,width:w,height:h}=setupCanvas($(canvasId));ctx.clearRect(0,0,w,h);state[screenKey]=[];const pts=rows.filter(r=>Number.isFinite(valueFn(r))).map(r=>({...r,alpha_deg:Number(r.alpha_deg),reynolds_number:Number(r.reynolds_number),value:valueFn(r),label}));if(!pts.length){drawAxes(ctx,w,h);return;}const minA=Math.min(...pts.map(r=>r.alpha_deg)),maxA=Math.max(...pts.map(r=>r.alpha_deg)),minV=Math.min(...pts.map(r=>r.value)),maxV=Math.max(...pts.map(r=>r.value));const ax=drawAxes(ctx,w,h,minA,maxA,minV,maxV);const sx=x=>ax.left+(x-minA)/(maxA-minA||1)*ax.plotW,sy=y=>ax.top+ax.plotH-(y-minV)/(maxV-minV||1)*ax.plotH;ctx.strokeStyle="#1f766f";ctx.lineWidth=2;ctx.beginPath();pts.forEach((r,i)=>{const px=sx(r.alpha_deg),py=sy(r.value);state[screenKey].push({...r,sx:px,sy:py});if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);});ctx.stroke();state[screenKey].forEach(r=>{ctx.fillStyle=Number(r.is_anomaly)===1?"#b42318":"#1f766f";ctx.beginPath();ctx.arc(r.sx,r.sy,3,0,Math.PI*2);ctx.fill();});}
-function drawCd(){const rows=state.performance.filter(r=>Number(r.reynolds_number)===state.selectedRe);drawLineSeries("cdCanvas",rows,r=>Number(r.cd),"cdScreen","CD（阻力系数）-alpha（攻角）");}
-function drawLd(){const rows=state.performance.filter(r=>Number(r.reynolds_number)===state.selectedRe);drawLineSeries("ldCanvas",rows,r=>Number(r.cd)?Number(r.cl)/Number(r.cd):NaN,"ldScreen","CL/CD（升阻比）-alpha（攻角）");}
-function drawCoordPie(){
-  const canvas=$("coordPieCanvas");
-  if(!canvas)return;
-  const {ctx,width:w,height:h}=setupCanvas(canvas);
-  ctx.clearRect(0,0,w,h);
-  const total=state.coordinates.length;
-  const counts={real:0,augmented:0,unknown:0,upper:0,lower:0};
-  state.coordinates.forEach(p=>{
-    const augmented=Number(p.is_augmented)===1||p.point_source==="augmented";
-    if(augmented)counts.augmented+=1;
-    else if(p.point_source==="real"||Number(p.is_augmented)===0)counts.real+=1;
-    else counts.unknown+=1;
-    if(p.surface==="upper")counts.upper+=1;
-    else if(p.surface==="lower")counts.lower+=1;
-  });
-  $("coordPieStatus").textContent=total?`${total} points · real ${counts.real} · augmented ${counts.augmented}`:"No coordinate points";
-  if(!total){
-    drawAxes(ctx,w,h);
-    return;
-  }
-  const slices=[
-    {key:"real",label:"real 真实点",value:counts.real,color:"#1f766f"},
-    {key:"augmented",label:"augmented 增强点",value:counts.augmented,color:"#b25d2a"},
-    {key:"unknown",label:"unknown 未分类",value:counts.unknown,color:"#7a8699"}
-  ].filter(s=>s.value>0);
-  const cx=Math.max(110,w*0.32),cy=h/2+8,r=Math.min(h*0.31,w*0.22,92);
-  let angle=-Math.PI/2;
-  slices.forEach(s=>{
-    const next=angle+(s.value/total)*Math.PI*2;
-    ctx.beginPath();
-    ctx.moveTo(cx,cy);
-    ctx.arc(cx,cy,r,angle,next);
-    ctx.closePath();
-    ctx.fillStyle=s.color;
-    ctx.fill();
-    ctx.strokeStyle="#fffdfa";
-    ctx.lineWidth=2;
-    ctx.stroke();
-    angle=next;
-  });
-  ctx.beginPath();
-  ctx.arc(cx,cy,r*0.48,0,Math.PI*2);
-  ctx.fillStyle="#fffdfa";
-  ctx.fill();
-  ctx.fillStyle="#172033";
-  ctx.font="700 16px Consolas";
-  ctx.textAlign="center";
-  ctx.textBaseline="middle";
-  ctx.fillText(String(total),cx,cy-5);
-  ctx.font="12px Consolas";
-  ctx.fillStyle="#62708a";
-  ctx.fillText("points",cx,cy+14);
-  const lx=Math.min(w-210,cx+r+46),ly=Math.max(46,cy-r+4);
-  ctx.textAlign="left";
-  ctx.textBaseline="middle";
-  ctx.font="13px Consolas";
-  slices.forEach((s,i)=>{
-    const y=ly+i*34;
-    const pct=total?Math.round(s.value/total*1000)/10:0;
-    ctx.fillStyle=s.color;
-    ctx.fillRect(lx,y-7,14,14);
-    ctx.fillStyle="#172033";
-    ctx.fillText(`${s.label}: ${s.value} (${pct}%)`,lx+24,y);
-  });
-  ctx.fillStyle="#62708a";
-  ctx.font="12px Consolas";
-  ctx.fillText(`upper 正面 ${counts.upper} · lower 反面 ${counts.lower}`,lx,ly+slices.length*34+8);
-}
+function drawCd(){const rows=state.performance.filter(r=>Number(r.reynolds_number)===state.selectedRe);drawLineSeries("cdCanvas",rows,r=>Number(r.cd),"cdScreen","CD-alpha");}
+function drawLd(){const rows=state.performance.filter(r=>Number(r.reynolds_number)===state.selectedRe);drawLineSeries("ldCanvas",rows,r=>Number(r.cd)?Number(r.cl)/Number(r.cd):NaN,"ldScreen","CL/CD-alpha");}
 async function drawCompare(){
-  const canvas=$("compareCanvas");
-  const scroll=$("compareScroll");
-  canvas.style.height="100%";
-  let {ctx,width:w,height:h}=setupCanvas(canvas);
+  const {ctx,width:w,height:h}=setupCanvas($("compareCanvas"));
   ctx.clearRect(0,0,w,h);
   state.compareScreen=[];
   const re=Number($("compareReSelect").value||50000);
   let rows=[];
   try{
-    rows=await getJson(`/api/performance_compare?reynolds_number=${re}&metric=${encodeURIComponent(state.compareMetric)}&limit=80`);
+    rows=await getJson(`/api/performance_compare?reynolds_number=${re}&metric=${encodeURIComponent(state.compareMetric)}`);
   }catch(e){
     drawAxes(ctx,w,h);
     ctx.fillStyle="#b42318";
@@ -7822,7 +5939,7 @@ async function drawCompare(){
     ctx.fillText(`compare load failed: ${String(e.error||e.message||"unknown error").slice(0,90)}`,60,42);
     return;
   }
-  rows=rows.map(r=>({...r,value:Number(r.value)})).filter(r=>Number.isFinite(r.value));
+  rows=rows.map(r=>({...r,value:Number(r.value)})).filter(r=>Number.isFinite(r.value)).slice(0,12);
   if(!rows.length){
     drawAxes(ctx,w,h);
     ctx.fillStyle="#62708a";
@@ -7830,17 +5947,11 @@ async function drawCompare(){
     ctx.fillText("No comparable performance records for this Re.",60,42);
     return;
   }
-  const visibleH=Math.max(260,scroll?scroll.clientHeight:300);
-  const fixedRowH=26;
-  const canvasH=Math.max(visibleH,92+rows.length*fixedRowH);
-  canvas.style.height=`${canvasH}px`;
-  ({ctx,width:w,height:h}=setupCanvas(canvas));
-  ctx.clearRect(0,0,w,h);
 
   const labelX=24,barX=178,top=20,bottom=54,right=40;
   const plotW=Math.max(120,w-barX-right);
-  const rowH=fixedRowH;
-  const barH=16;
+  const rowH=Math.max(18,(h-top-bottom)/rows.length);
+  const barH=Math.min(18,rowH*0.58);
   const values=rows.map(r=>r.value);
   const minV=Math.min(0,...values),maxV=Math.max(...values);
   const scale=v=>(v-minV)/(maxV-minV||1)*plotW;
@@ -7885,19 +5996,16 @@ async function drawCompare(){
 }
 function scheduleSecondaryCharts(){clearTimeout(state.secondaryChartTimer);state.secondaryChartTimer=setTimeout(()=>{if($("pageOverview").classList.contains("active")){drawCompare();drawVersionDiff();}},250);}
 async function drawVersionDiff(){
-  const canvas=$("versionDiffCanvas");
-  const scroll=$("versionDiffScroll");
-  canvas.style.height="100%";
-  let {ctx,width:w,height:h}=setupCanvas(canvas);
+  const {ctx,width:w,height:h}=setupCanvas($("versionDiffCanvas"));
   ctx.clearRect(0,0,w,h);
   state.versionDiffScreen=[];
   const re=Number(state.selectedRe||$("compareReSelect").value||50000);
   let rows=[];
   try{
-    rows=await getJson(`/api/version_compare?reynolds_number=${re}&limit=200`);
+    rows=await getJson(`/api/version_compare?reynolds_number=${re}`);
   }catch(e){return;}
-  rows=rows.map(r=>({...r,value:Number(r.value)})).filter(r=>Number.isFinite(r.value));
-  $("versionDiffStatus").textContent=`Re（雷诺数） ${Number(re).toLocaleString()} · 全库版本最大 CL/CD（升阻比）对比`;
+  rows=rows.map(r=>({...r,value:Number(r.value)})).filter(r=>Number.isFinite(r.value)).slice(0,14);
+  $("versionDiffStatus").textContent=`Re ${Number(re).toLocaleString()} · 全库版本最大 CL/CD 对比`;
   if(!rows.length){
     drawAxes(ctx,w,h);
     ctx.fillStyle="#62708a";
@@ -7905,17 +6013,11 @@ async function drawVersionDiff(){
     ctx.fillText("No version performance records at this Reynolds number.",44,44);
     return;
   }
-  const visibleH=Math.max(260,scroll?scroll.clientHeight:300);
-  const fixedRowH=26;
-  const canvasH=Math.max(visibleH,92+rows.length*fixedRowH);
-  canvas.style.height=`${canvasH}px`;
-  ({ctx,width:w,height:h}=setupCanvas(canvas));
-  ctx.clearRect(0,0,w,h);
 
   const labelX=24,barX=210,top=20,bottom=54,right=40;
   const plotW=Math.max(120,w-barX-right);
-  const rowH=fixedRowH;
-  const barH=16;
+  const rowH=Math.max(18,(h-top-bottom)/rows.length);
+  const barH=Math.min(16,rowH*0.58);
   const maxV=Math.max(...rows.map(r=>r.value))||1;
 
   ctx.strokeStyle="#e7ebf2";
@@ -7947,68 +6049,7 @@ async function drawVersionDiff(){
     state.versionDiffScreen.push({...r,label:rawLabel,value,x:barX,y:y-barH/2,w:barW,h:barH});
   });
 }
-function drawShape(){
-  const {ctx,width:w,height:h}=setupCanvas($("shapeCanvas"));
-  ctx.clearRect(0,0,w,h);
-  const pts=state.coordinates.map(p=>({...p,x:Number(p.x),y:Number(p.y)})).filter(p=>Number.isFinite(p.x)&&Number.isFinite(p.y));
-  state.shapeScreen=[];
-  if(!pts.length){drawAxes(ctx,w,h);return;}
-  const minX=Math.min(...pts.map(p=>p.x)),maxX=Math.max(...pts.map(p=>p.x)),minY=Math.min(...pts.map(p=>p.y)),maxY=Math.max(...pts.map(p=>p.y));
-  const rawXRange=maxX-minX||1;
-  const rawYRange=maxY-minY||1;
-  const ax=drawAxes(ctx,w,h,minX,maxX,minY,maxY);
-  const scale=Math.min(ax.plotW/rawXRange,ax.plotH/rawYRange);
-  const drawnW=rawXRange*scale;
-  const drawnH=rawYRange*scale;
-  const offsetX=ax.left+(ax.plotW-drawnW)/2;
-  const offsetY=ax.top+(ax.plotH-drawnH)/2;
-  const sx=x=>offsetX+(x-minX)*scale;
-  const sy=y=>offsetY+drawnH-(y-minY)*scale;
-  const colors={upper:"#1f766f",lower:"#2563a6",unknown:"#526071"};
-  const hasAnomaly=state.anomalies&&state.anomalies.length>0;
-  pts.forEach(p=>state.shapeScreen.push({...p,sx:sx(p.x),sy:sy(p.y)}));
-  ["upper","lower"].forEach(surface=>{
-    const rows=state.shapeScreen.filter(p=>p.surface===surface).sort((a,b)=>Number(a.point_order)-Number(b.point_order));
-    if(!rows.length)return;
-    ctx.strokeStyle=colors[surface];
-    ctx.lineWidth=2.4;
-    ctx.beginPath();
-    rows.forEach((p,i)=>{if(i===0)ctx.moveTo(p.sx,p.sy);else ctx.lineTo(p.sx,p.sy);});
-    ctx.stroke();
-  });
-  state.shapeScreen.filter(p=>!["upper","lower"].includes(p.surface)).forEach((p,i)=>{
-    if(i===0){ctx.strokeStyle=colors.unknown;ctx.lineWidth=1.6;ctx.beginPath();}
-    ctx.lineTo(p.sx,p.sy);
-  });
-  state.shapeScreen.forEach((p,i)=>{
-    const augmented=Number(p.is_augmented)===1||p.point_source==="augmented";
-    const surfaceColor=colors[p.surface]||colors.unknown;
-    if(augmented){
-      ctx.save();
-      ctx.translate(p.sx,p.sy);
-      ctx.rotate(Math.PI/4);
-      ctx.fillStyle="#b25d2a";
-      ctx.strokeStyle="#fff7ed";
-      ctx.lineWidth=1.2;
-      ctx.fillRect(-3.5,-3.5,7,7);
-      ctx.strokeRect(-3.5,-3.5,7,7);
-      ctx.restore();
-    }else if(i%8===0||p.surface!==state.shapeScreen[i-1]?.surface){
-      ctx.fillStyle=surfaceColor;
-      ctx.beginPath();
-      ctx.arc(p.sx,p.sy,2.4,0,Math.PI*2);
-      ctx.fill();
-    }
-    if(hasAnomaly&&i%18===0){
-      ctx.strokeStyle="#b42318";
-      ctx.lineWidth=1.3;
-      ctx.beginPath();
-      ctx.arc(p.sx,p.sy,5.2,0,Math.PI*2);
-      ctx.stroke();
-    }
-  });
-
-}
+function drawShape(){const {ctx,width:w,height:h}=setupCanvas($("shapeCanvas"));ctx.clearRect(0,0,w,h);const pts=state.coordinates.map(p=>({...p,x:Number(p.x),y:Number(p.y)}));state.shapeScreen=[];if(!pts.length){drawAxes(ctx,w,h);return;}const minX=Math.min(...pts.map(p=>p.x)),maxX=Math.max(...pts.map(p=>p.x)),minY=Math.min(...pts.map(p=>p.y)),maxY=Math.max(...pts.map(p=>p.y));const ax=drawAxes(ctx,w,h,minX,maxX,minY,maxY);const sx=x=>ax.left+(x-minX)/(maxX-minX||1)*ax.plotW,sy=y=>ax.top+ax.plotH-(y-minY)/(maxY-minY||1)*ax.plotH;ctx.strokeStyle="#1f766f";ctx.lineWidth=2;ctx.beginPath();pts.forEach((p,i)=>{const px=sx(p.x),py=sy(p.y);state.shapeScreen.push({...p,sx:px,sy:py});if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);});ctx.stroke();state.shapeScreen.forEach((p,i)=>{if(i%10===0||p.point_source==="augmented"){ctx.fillStyle=p.point_source==="augmented"?"#b25d2a":"#1f766f";ctx.beginPath();ctx.arc(p.sx,p.sy,p.point_source==="augmented"?3:2,0,Math.PI*2);ctx.fill();}});}
 function drawPerformance(){const {ctx,width:w,height:h}=setupCanvas($("perfCanvas"));ctx.clearRect(0,0,w,h);const rows=state.performance.filter(r=>Number(r.reynolds_number)===state.selectedRe).map(r=>({...r,a:Number(r.alpha_deg),cln:Number(r.cl),anom:Number(r.is_anomaly)===1}));state.perfScreen=[];if(!rows.length){drawAxes(ctx,w,h);return;}const minA=Math.min(...rows.map(r=>r.a)),maxA=Math.max(...rows.map(r=>r.a)),minC=Math.min(...rows.map(r=>r.cln)),maxC=Math.max(...rows.map(r=>r.cln));const ax=drawAxes(ctx,w,h,minA,maxA,minC,maxC);const sx=x=>ax.left+(x-minA)/(maxA-minA||1)*ax.plotW,sy=y=>ax.top+ax.plotH-(y-minC)/(maxC-minC||1)*ax.plotH;ctx.strokeStyle="#1f766f";ctx.lineWidth=2;ctx.beginPath();rows.forEach((r,i)=>{const px=sx(r.a),py=sy(r.cln);state.perfScreen.push({...r,sx:px,sy:py});if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);});ctx.stroke();state.perfScreen.forEach(r=>{ctx.fillStyle=r.anom?"#b42318":"#1f766f";ctx.beginPath();ctx.arc(r.sx,r.sy,r.anom?4:3,0,Math.PI*2);ctx.fill();});}
 init().catch(err=>{$("summary").textContent="Frontend failed. Check Flask/MySQL.";console.error(err);});
 </script>
@@ -8023,5 +6064,7 @@ if __name__ == "__main__":
         port=int(os.getenv("FLASK_PORT", "5000")),
         debug=os.getenv("FLASK_DEBUG", "0") == "1",
     )
+
+
 
 
